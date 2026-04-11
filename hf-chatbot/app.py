@@ -31,7 +31,7 @@ DEFAULT_MODEL_ID = "Qwen/Qwen2.5-72B-Instruct"
 MODEL_ID = os.environ.get("HF_MODEL_ID", DEFAULT_MODEL_ID)
 MAX_NEW_TOKENS = int(os.environ.get("HF_MAX_NEW_TOKENS", "1024"))
 WHISPER_MODEL_SIZE = os.environ.get("HF_WHISPER_MODEL", "small")
-HF_TOKEN = os.environ.get("HUGGING_FACE_HUB_TOKEN", "")
+HF_TOKEN = os.environ.get("HUGGING_FACE_HUB_TOKEN", "") or os.environ.get("HF_TOKEN", "")
 
 SYSTEM_PROMPT = os.environ.get("HF_SYSTEM_PROMPT", """\
 You are an expert interview coach. Your job is to help users prepare for job interviews.
@@ -309,7 +309,7 @@ def main() -> None:
             "Paste a **job description** (or a URL to one) to start your mock interview."
         )
 
-        chatbot = gr.Chatbot(type="messages", height=500)
+        chatbot = gr.Chatbot(height=500)
         state = gr.State([])  # chat history as list[dict]
 
         with gr.Row():
