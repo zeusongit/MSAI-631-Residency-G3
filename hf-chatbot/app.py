@@ -6,8 +6,9 @@ tailored technical and behavioral interview questions, evaluates answers
 with constructive feedback, and asks follow-up questions before moving on.
 
 Supports voice input via browser microphone (transcribed with Whisper),
-file upload (PDF/DOCX/TXT), difficulty selection, answer timing, and
-session export as PDF.
+file upload (PDF/DOCX/TXT), difficulty selection, answer timing, session
+export as PDF, and dynamic UI (MCQ radio buttons, rating sliders) that
+adapts to each question type.
 
 Set HUGGING_FACE_HUB_TOKEN for API access. See README for all env vars.
 """
@@ -100,6 +101,25 @@ particular role. Keep it encouraging but real. Offer to save the summary.
 - If an answer is weak, coach them through it: "What if you also mentioned..."
 - If they say "skip" or "next", just smoothly move on
 - If they say "done" or "end", wrap up with the summary
+
+## Dynamic UI hints — FOLLOW EXACTLY:
+
+After EVERY message that ends with a direct question to the user, append a single \
+`<ui_hint>` tag on a new line at the very end. Choose the type that best fits:
+
+- Open-ended (default): <ui_hint>{"type": "open"}</ui_hint>
+- Multiple choice — 4 distinct, plausible options: \
+<ui_hint>{"type": "mcq", "options": ["Option A", "Option B", "Option C", "Option D"]}</ui_hint>
+- Self-rating or confidence check: \
+<ui_hint>{"type": "rating", "min": 1, "max": 5, "label": "How confident are you? (1=not at all, 5=very)"}</ui_hint>
+
+Rules:
+- ONLY append a hint when your message ends with a direct question
+- Do NOT append a hint on pure feedback, acknowledgements, or summary messages
+- For MCQ: generate realistic, clearly distinct options relevant to the question
+- Use MCQ for factual/knowledge questions where a few clear answers exist
+- Use rating for confidence checks, self-assessments, or "how well do you know X?"
+- Use open for everything else (behavioral, scenario, explanation questions)
 """)
 
 # ── Tool definitions (OpenAI-compatible format) ─────────────────────────────
@@ -267,6 +287,66 @@ def _transcribe_audio(audio_tuple) -> str:
     finally:
         os.unlink(tmp_path)
 
+# ── UI hint parsing ─────────────────────────────────────────────────────────
+
+_UI_HINT_RE = re.compile(r"<ui_hint>(.*?)</ui_hint>", re.DOTALL)
+
+
+def _parse_ui_hint(text: str) -> tuple[str, dict]:
+    """Strip the <ui_hint> tag from the model reply and return (clean_text, hint_dict)."""
+    match = _UI_HINT_RE.search(text)
+    if not match:
+        return text.strip(), {"type": "open"}
+    try:
+        hint = json.loads(match.group(1).strip())
+    except (json.JSONDecodeError, ValueError):
+        hint = {"type": "open"}
+    clean = _UI_HINT_RE.sub("", text).strip()
+    return clean, hint
+
+
+def _input_visibility(hint: dict) -> tuple:
+    """
+    Return gr.update() tuples for all dynamic input rows/components.
+    Order: (text_row, mcq_row, mcq_radio, rating_row, rating_slider)
+
+    The text input row is ALWAYS visible so the conversation can always
+    continue. MCQ and rating rows appear above it as additional options.
+    """
+    qtype = hint.get("type", "open")
+    if qtype == "mcq":
+        options = hint.get("options") or []
+        if options:
+            return (
+                gr.update(visible=True),
+                gr.update(visible=True),
+                gr.update(choices=options, value=None),
+                gr.update(visible=False),
+                gr.update(),
+            )
+    if qtype == "rating":
+        return (
+            gr.update(visible=True),
+            gr.update(visible=False),
+            gr.update(choices=[], value=None),
+            gr.update(visible=True),
+            gr.update(
+                minimum=hint.get("min", 1),
+                maximum=hint.get("max", 5),
+                value=hint.get("min", 1),
+                label=hint.get("label", "Your rating"),
+            ),
+        )
+    # default / open / mcq with no options: text input only
+    return (
+        gr.update(visible=True),
+        gr.update(visible=False),
+        gr.update(choices=[], value=None),
+        gr.update(visible=False),
+        gr.update(),
+    )
+
+
 # ── Chat logic ──────────────────────────────────────────────────────────────
 
 
@@ -335,11 +415,12 @@ def _get_client() -> InferenceClient:
     return _client
 
 
-def _respond(message: str, history: list[dict], difficulty: str) -> str:
-    """Generate the next assistant reply."""
+def _respond(message: str, history: list[dict], difficulty: str) -> tuple[str, dict]:
+    """Generate the next assistant reply; returns (display_text, ui_hint)."""
     messages = _build_messages(history, difficulty)
     messages.append({"role": "user", "content": message})
-    return _call_model(messages, _get_client())
+    raw = _call_model(messages, _get_client())
+    return _parse_ui_hint(raw)
 
 # ── Answer timer helpers ────────────────────────────────────────────────────
 
@@ -394,6 +475,11 @@ def _export_chat_pdf(history: list[dict]) -> str | None:
 
 # ── Gradio UI ───────────────────────────────────────────────────────────────
 
+# Outputs shared by all submit handlers:
+# (chatbot, state, txt, timer_display, question_ts,
+#  text_input_row, mcq_input_row, mcq_radio, rating_input_row, rating_slider)
+_N_OUTPUTS = 10
+
 
 def main() -> None:
     with gr.Blocks(title="Interview Prep Bot") as demo:
@@ -434,10 +520,14 @@ def main() -> None:
         # ── Chat area ──────────────────────────────────────────────────
 
         chatbot = gr.Chatbot(height=450)
-        state = gr.State([])  # chat history as list[dict]
-        question_ts = gr.State(0.0)  # timestamp when last bot message was shown
+        state = gr.State([])        # chat history as list[dict]
+        question_ts = gr.State(0.0) # timestamp when last bot message was shown
 
-        with gr.Row():
+        # ── Dynamic answer inputs ───────────────────────────────────────
+        # Only one row is visible at a time; toggled based on the ui_hint
+        # returned by the model with each question.
+
+        with gr.Row(visible=True) as text_input_row:
             txt = gr.Textbox(
                 placeholder="Type your answer (or paste a JD / URL to begin)...",
                 show_label=False,
@@ -445,58 +535,125 @@ def main() -> None:
             )
             send_btn = gr.Button("Send", variant="primary", scale=1)
 
+        with gr.Row(visible=False) as mcq_input_row:
+            mcq_radio = gr.Radio(
+                choices=[],
+                label="Choose the best answer",
+                interactive=True,
+                scale=4,
+            )
+            mcq_btn = gr.Button("Submit Answer", variant="primary", scale=1)
+
+        with gr.Row(visible=False) as rating_input_row:
+            rating_slider = gr.Slider(
+                minimum=1,
+                maximum=5,
+                value=3,
+                step=1,
+                label="Your rating",
+                interactive=True,
+                scale=4,
+            )
+            rating_btn = gr.Button("Submit Rating", variant="primary", scale=1)
+
         # ── Voice input ─────────────────────────────────────────────────
 
         with gr.Accordion("Voice input", open=False):
             audio = gr.Audio(sources=["microphone"], type="numpy", label="Record your answer")
             voice_btn = gr.Button("Transcribe & Send")
 
+        # ── Shared output list ───────────────────────────────────────────
+
+        _outputs = [
+            chatbot, state, txt, timer_display, question_ts,
+            text_input_row, mcq_input_row, mcq_radio, rating_input_row, rating_slider,
+        ]
+
         # ── File upload handler ─────────────────────────────────────────
 
         def _on_file_upload(file, history: list[dict], diff: str):
             if file is None:
-                return history, history, "", 0.0
+                return (history, history, "", "", 0.0) + _input_visibility({"type": "open"})
             text = _extract_file_text(file)
             if text.startswith("Error"):
                 history = history + [{"role": "assistant", "content": text}]
-                return history, history, "", 0.0
+                return (history, history, "", "", 0.0) + _input_visibility({"type": "open"})
             user_msg = f"Here is the job description:\n\n{text}"
             history = history + [{"role": "user", "content": user_msg}]
-            reply = _respond(user_msg, history[:-1], diff)
+            reply, hint = _respond(user_msg, history[:-1], diff)
             history = history + [{"role": "assistant", "content": reply}]
-            return history, history, "", time.time()
+            return (history, history, "", "", time.time()) + _input_visibility(hint)
 
         upload_btn.click(
             _on_file_upload,
             [file_upload, state, difficulty],
-            [chatbot, state, timer_display, question_ts],
+            _outputs,
         )
 
         # ── Text submit ─────────────────────────────────────────────────
 
         def _on_text_submit(message: str, history: list[dict], diff: str, ts: float):
             if not message.strip():
-                return history, history, "", "", ts
-            # Calculate answer time if there's a previous bot question
+                return (history, history, "", "", ts) + _input_visibility({"type": "open"})
             duration_str = ""
             if ts > 0 and history and history[-1].get("role") == "assistant":
-                elapsed = time.time() - ts
-                duration_str = _format_duration(elapsed)
+                duration_str = _format_duration(time.time() - ts)
 
             history = history + [{"role": "user", "content": message}]
-            reply = _respond(message, history[:-1], diff)
+            reply, hint = _respond(message, history[:-1], diff)
             history = history + [{"role": "assistant", "content": reply}]
-            return history, history, "", duration_str, time.time()
+            return (history, history, "", duration_str, time.time()) + _input_visibility(hint)
 
         txt.submit(
             _on_text_submit,
             [txt, state, difficulty, question_ts],
-            [chatbot, state, txt, timer_display, question_ts],
+            _outputs,
         )
         send_btn.click(
             _on_text_submit,
             [txt, state, difficulty, question_ts],
-            [chatbot, state, txt, timer_display, question_ts],
+            _outputs,
+        )
+
+        # ── MCQ submit ──────────────────────────────────────────────────
+
+        def _on_mcq_submit(selection, history: list[dict], diff: str, ts: float):
+            if not selection:
+                return (history, history, "", "", ts) + _input_visibility({"type": "mcq"})
+            duration_str = ""
+            if ts > 0 and history and history[-1].get("role") == "assistant":
+                duration_str = _format_duration(time.time() - ts)
+
+            history = history + [{"role": "user", "content": selection}]
+            reply, hint = _respond(selection, history[:-1], diff)
+            history = history + [{"role": "assistant", "content": reply}]
+            return (history, history, "", duration_str, time.time()) + _input_visibility(hint)
+
+        mcq_btn.click(
+            _on_mcq_submit,
+            [mcq_radio, state, difficulty, question_ts],
+            _outputs,
+        )
+
+        # ── Rating submit ───────────────────────────────────────────────
+
+        def _on_rating_submit(value, history: list[dict], diff: str, ts: float):
+            if value is None:
+                return (history, history, "", "", ts) + _input_visibility({"type": "rating"})
+            duration_str = ""
+            if ts > 0 and history and history[-1].get("role") == "assistant":
+                duration_str = _format_duration(time.time() - ts)
+
+            message = str(int(value))
+            history = history + [{"role": "user", "content": message}]
+            reply, hint = _respond(message, history[:-1], diff)
+            history = history + [{"role": "assistant", "content": reply}]
+            return (history, history, "", duration_str, time.time()) + _input_visibility(hint)
+
+        rating_btn.click(
+            _on_rating_submit,
+            [rating_slider, state, difficulty, question_ts],
+            _outputs,
         )
 
         # ── Voice submit ────────────────────────────────────────────────
@@ -504,21 +661,20 @@ def main() -> None:
         def _on_voice_submit(audio_data, history: list[dict], diff: str, ts: float):
             text = _transcribe_audio(audio_data)
             if not text:
-                return history, history, None, "", ts
+                return (history, history, "", "", ts) + _input_visibility({"type": "open"})
             duration_str = ""
             if ts > 0 and history and history[-1].get("role") == "assistant":
-                elapsed = time.time() - ts
-                duration_str = _format_duration(elapsed)
+                duration_str = _format_duration(time.time() - ts)
 
             history = history + [{"role": "user", "content": f"[voice] {text}"}]
-            reply = _respond(text, history[:-1], diff)
+            reply, hint = _respond(text, history[:-1], diff)
             history = history + [{"role": "assistant", "content": reply}]
-            return history, history, None, duration_str, time.time()
+            return (history, history, "", duration_str, time.time()) + _input_visibility(hint)
 
         voice_btn.click(
             _on_voice_submit,
             [audio, state, difficulty, question_ts],
-            [chatbot, state, audio, timer_display, question_ts],
+            _outputs,
         )
 
         # ── PDF export ──────────────────────────────────────────────────
