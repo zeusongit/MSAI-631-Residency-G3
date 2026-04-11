@@ -1,21 +1,25 @@
 """
 Interview Prep Chatbot — Gradio UI powered by Hugging Face Inference API.
 
-Given a job description (pasted text, URL, or file upload), the bot asks
+Given a job description (pasted text, URL, or uploaded file), the bot asks
 tailored technical and behavioral interview questions, evaluates answers
 with constructive feedback, and asks follow-up questions before moving on.
 
-Supports voice input via browser microphone (transcribed with Whisper).
+Supports voice input via browser microphone (transcribed with Whisper),
+file upload (PDF/DOCX/TXT), difficulty selection, answer timing, and
+session export as PDF.
 
 Set HUGGING_FACE_HUB_TOKEN for API access. See README for all env vars.
 """
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import re
 import tempfile
+import time
 
 import gradio as gr
 import numpy as np
@@ -32,6 +36,25 @@ MODEL_ID = os.environ.get("HF_MODEL_ID", DEFAULT_MODEL_ID)
 MAX_NEW_TOKENS = int(os.environ.get("HF_MAX_NEW_TOKENS", "1024"))
 WHISPER_MODEL_SIZE = os.environ.get("HF_WHISPER_MODEL", "small")
 HF_TOKEN = os.environ.get("HUGGING_FACE_HUB_TOKEN", "") or os.environ.get("HF_TOKEN", "")
+
+DIFFICULTY_PROMPTS = {
+    "Easy": (
+        "Adjust your questions to an ENTRY-LEVEL / JUNIOR difficulty. "
+        "Ask straightforward questions about fundamentals, basic concepts, "
+        "and simple scenario-based behavioral questions. Be extra supportive."
+    ),
+    "Medium": (
+        "Adjust your questions to a MID-LEVEL difficulty. "
+        "Ask questions that require solid understanding, some depth, "
+        "and real-world examples. Balance challenge with encouragement."
+    ),
+    "Hard": (
+        "Adjust your questions to a SENIOR / STAFF-LEVEL difficulty. "
+        "Ask deep technical questions, complex system design scenarios, "
+        "and behavioral questions that probe leadership and conflict resolution. "
+        "Be rigorous — this person wants to be pushed."
+    ),
+}
 
 SYSTEM_PROMPT = os.environ.get("HF_SYSTEM_PROMPT", """\
 You are a friendly, experienced interview coach having a natural conversation. \
@@ -183,6 +206,29 @@ def _execute_tool(tool_call) -> dict:
     result = func(**args) if func else f"Unknown tool: {name}"
     return {"role": "tool", "tool_call_id": tool_call.id, "content": str(result)}
 
+# ── File parsing ────────────────────────────────────────────────────────────
+
+
+def _extract_file_text(file_path: str) -> str:
+    """Extract text from an uploaded PDF, DOCX, or plain text file."""
+    ext = os.path.splitext(file_path)[1].lower()
+    try:
+        if ext == ".pdf":
+            import pypdf
+            reader = pypdf.PdfReader(file_path)
+            text = "\n".join(page.extract_text() or "" for page in reader.pages)
+            return text[:5000]
+        elif ext in (".docx", ".doc"):
+            import docx
+            doc = docx.Document(file_path)
+            text = "\n".join(p.text for p in doc.paragraphs)
+            return text[:5000]
+        else:
+            with open(file_path) as f:
+                return f.read()[:5000]
+    except Exception as e:
+        return f"Error reading file: {e}"
+
 # ── Whisper (voice transcription) ───────────────────────────────────────────
 
 _whisper_model: WhisperModel | None = None
@@ -224,11 +270,13 @@ def _transcribe_audio(audio_tuple) -> str:
 # ── Chat logic ──────────────────────────────────────────────────────────────
 
 
-def _build_messages(history: list[dict]) -> list[dict]:
+def _build_messages(history: list[dict], difficulty: str) -> list[dict]:
     """Assemble the full message list from Gradio chat history."""
     messages: list[dict] = []
-    if SYSTEM_PROMPT.strip():
-        messages.append({"role": "system", "content": SYSTEM_PROMPT.strip()})
+    prompt = SYSTEM_PROMPT.strip()
+    if difficulty in DIFFICULTY_PROMPTS:
+        prompt += "\n\n" + DIFFICULTY_PROMPTS[difficulty]
+    messages.append({"role": "system", "content": prompt})
     for item in history:
         if isinstance(item, dict):
             role = item.get("role", "")
@@ -287,20 +335,62 @@ def _get_client() -> InferenceClient:
     return _client
 
 
-def respond(message: str, history: list[dict]) -> str:
-    """Gradio ChatInterface callback — generate the next assistant reply."""
-    messages = _build_messages(history)
+def _respond(message: str, history: list[dict], difficulty: str) -> str:
+    """Generate the next assistant reply."""
+    messages = _build_messages(history, difficulty)
     messages.append({"role": "user", "content": message})
     return _call_model(messages, _get_client())
 
+# ── Answer timer helpers ────────────────────────────────────────────────────
 
-def transcribe_and_respond(audio, history: list[dict]) -> tuple[str, str]:
-    """Transcribe voice input, then generate a response."""
-    text = _transcribe_audio(audio)
-    if not text:
-        return "", "Could not transcribe audio. Please try again or type your answer."
-    reply = respond(text, history)
-    return text, reply
+
+def _format_duration(seconds: float) -> str:
+    """Format seconds into a readable string like '1m 23s'."""
+    m, s = divmod(int(seconds), 60)
+    if m > 0:
+        return f"{m}m {s}s"
+    return f"{s}s"
+
+# ── PDF export ──────────────────────────────────────────────────────────────
+
+
+def _export_chat_pdf(history: list[dict]) -> str | None:
+    """Export the chat history as a PDF file and return the file path."""
+    if not history:
+        return None
+    try:
+        from fpdf import FPDF
+    except ImportError:
+        return None
+
+    pdf = FPDF()
+    pdf.set_auto_page_break(auto=True, margin=15)
+    pdf.add_page()
+    pdf.set_font("Helvetica", "B", 16)
+    pdf.cell(0, 10, "Interview Prep Session", ln=True, align="C")
+    pdf.ln(5)
+    pdf.set_font("Helvetica", size=10)
+
+    for item in history:
+        if not isinstance(item, dict):
+            continue
+        role = item.get("role", "")
+        content = item.get("content", "")
+        if role not in ("user", "assistant") or not content:
+            continue
+
+        label = "You" if role == "user" else "Coach"
+        pdf.set_font("Helvetica", "B", 10)
+        pdf.cell(0, 6, f"{label}:", ln=True)
+        pdf.set_font("Helvetica", size=10)
+        # Encode to latin-1 for fpdf, replacing unsupported chars
+        safe_text = content.encode("latin-1", errors="replace").decode("latin-1")
+        pdf.multi_cell(0, 5, safe_text)
+        pdf.ln(3)
+
+    tmp = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
+    pdf.output(tmp.name)
+    return tmp.name
 
 # ── Gradio UI ───────────────────────────────────────────────────────────────
 
@@ -311,11 +401,41 @@ def main() -> None:
             "# Interview Prep Bot\n"
             f"Model: `{MODEL_ID}` via Inference API &nbsp;|&nbsp; "
             "Voice input powered by Whisper\n\n"
-            "Paste a **job description** (or a URL to one) to start your mock interview."
+            "Paste a **job description**, upload a file, or provide a URL to start."
         )
 
-        chatbot = gr.Chatbot(height=500)
+        # ── Settings row ────────────────────────────────────────────────
+
+        with gr.Row():
+            difficulty = gr.Radio(
+                choices=["Easy", "Medium", "Hard"],
+                value="Medium",
+                label="Difficulty",
+                scale=2,
+            )
+            timer_display = gr.Textbox(
+                value="",
+                label="Answer time",
+                interactive=False,
+                scale=1,
+            )
+            export_btn = gr.Button("Export as PDF", scale=1)
+            export_file = gr.File(label="Download", visible=False)
+
+        # ── File upload ─────────────────────────────────────────────────
+
+        with gr.Accordion("Upload a job description file", open=False):
+            file_upload = gr.File(
+                label="Upload JD (PDF, DOCX, or TXT)",
+                file_types=[".pdf", ".docx", ".doc", ".txt"],
+            )
+            upload_btn = gr.Button("Use this file")
+
+        # ── Chat area ──────────────────────────────────────────────────
+
+        chatbot = gr.Chatbot(height=450)
         state = gr.State([])  # chat history as list[dict]
+        question_ts = gr.State(0.0)  # timestamp when last bot message was shown
 
         with gr.Row():
             txt = gr.Textbox(
@@ -325,35 +445,91 @@ def main() -> None:
             )
             send_btn = gr.Button("Send", variant="primary", scale=1)
 
+        # ── Voice input ─────────────────────────────────────────────────
+
         with gr.Accordion("Voice input", open=False):
             audio = gr.Audio(sources=["microphone"], type="numpy", label="Record your answer")
             voice_btn = gr.Button("Transcribe & Send")
 
+        # ── File upload handler ─────────────────────────────────────────
+
+        def _on_file_upload(file, history: list[dict], diff: str):
+            if file is None:
+                return history, history, "", 0.0
+            text = _extract_file_text(file)
+            if text.startswith("Error"):
+                history = history + [{"role": "assistant", "content": text}]
+                return history, history, "", 0.0
+            user_msg = f"Here is the job description:\n\n{text}"
+            history = history + [{"role": "user", "content": user_msg}]
+            reply = _respond(user_msg, history[:-1], diff)
+            history = history + [{"role": "assistant", "content": reply}]
+            return history, history, "", time.time()
+
+        upload_btn.click(
+            _on_file_upload,
+            [file_upload, state, difficulty],
+            [chatbot, state, timer_display, question_ts],
+        )
+
         # ── Text submit ─────────────────────────────────────────────────
 
-        def _on_text_submit(message: str, history: list[dict]):
+        def _on_text_submit(message: str, history: list[dict], diff: str, ts: float):
             if not message.strip():
-                return history, history, ""
-            history = history + [{"role": "user", "content": message}]
-            reply = respond(message, history[:-1])  # history before this msg
-            history = history + [{"role": "assistant", "content": reply}]
-            return history, history, ""
+                return history, history, "", "", ts
+            # Calculate answer time if there's a previous bot question
+            duration_str = ""
+            if ts > 0 and history and history[-1].get("role") == "assistant":
+                elapsed = time.time() - ts
+                duration_str = _format_duration(elapsed)
 
-        txt.submit(_on_text_submit, [txt, state], [chatbot, state, txt])
-        send_btn.click(_on_text_submit, [txt, state], [chatbot, state, txt])
+            history = history + [{"role": "user", "content": message}]
+            reply = _respond(message, history[:-1], diff)
+            history = history + [{"role": "assistant", "content": reply}]
+            return history, history, "", duration_str, time.time()
+
+        txt.submit(
+            _on_text_submit,
+            [txt, state, difficulty, question_ts],
+            [chatbot, state, txt, timer_display, question_ts],
+        )
+        send_btn.click(
+            _on_text_submit,
+            [txt, state, difficulty, question_ts],
+            [chatbot, state, txt, timer_display, question_ts],
+        )
 
         # ── Voice submit ────────────────────────────────────────────────
 
-        def _on_voice_submit(audio_data, history: list[dict]):
+        def _on_voice_submit(audio_data, history: list[dict], diff: str, ts: float):
             text = _transcribe_audio(audio_data)
             if not text:
-                return history, history, None
-            history = history + [{"role": "user", "content": f"[voice] {text}"}]
-            reply = respond(text, history[:-1])
-            history = history + [{"role": "assistant", "content": reply}]
-            return history, history, None
+                return history, history, None, "", ts
+            duration_str = ""
+            if ts > 0 and history and history[-1].get("role") == "assistant":
+                elapsed = time.time() - ts
+                duration_str = _format_duration(elapsed)
 
-        voice_btn.click(_on_voice_submit, [audio, state], [chatbot, state, audio])
+            history = history + [{"role": "user", "content": f"[voice] {text}"}]
+            reply = _respond(text, history[:-1], diff)
+            history = history + [{"role": "assistant", "content": reply}]
+            return history, history, None, duration_str, time.time()
+
+        voice_btn.click(
+            _on_voice_submit,
+            [audio, state, difficulty, question_ts],
+            [chatbot, state, audio, timer_display, question_ts],
+        )
+
+        # ── PDF export ──────────────────────────────────────────────────
+
+        def _on_export(history: list[dict]):
+            path = _export_chat_pdf(history)
+            if path is None:
+                return gr.update(visible=False)
+            return gr.update(value=path, visible=True)
+
+        export_btn.click(_on_export, [state], [export_file])
 
     demo.launch(
         server_name="0.0.0.0",
