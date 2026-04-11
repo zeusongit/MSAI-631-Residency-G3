@@ -1,11 +1,54 @@
 # Interview Prep Chatbot
 
-**Gradio + Hugging Face** interview coaching bot. Paste a job description (or URL) and the bot conducts a tailored mock interview with technical and behavioral questions, evaluates your answers, asks follow-ups, and provides a session summary.
+**Gradio + Hugging Face** technical interview coaching bot. Paste a job description (or URL), optionally upload your resume, and the bot conducts a tailored mock interview focused on technical depth. It scores your answers, streams responses in real time, and lets you save sessions for later review.
 
-**Features:**
-- Tool calling — fetches JD from URLs, searches the web for company context, saves session summaries
-- Voice input — record answers via browser microphone, transcribed locally with Whisper
-- Adaptive follow-ups — probes deeper before moving to the next topic
+## Architecture
+
+Single-file Gradio app (`hf-chatbot/app.py`) — no backend database or separate server. The LLM runs remotely via the HF Inference API; only Whisper runs locally for voice transcription.
+
+```
+Browser (Gradio UI)
+  ├─ Text / Voice / File input
+  ├─ localStorage (session save/load)
+  └─ Markdown rendering (code blocks)
+        │
+        ▼
+   app.py (Python, aiohttp)
+  ├─ _build_messages()  → assembles system prompt + difficulty + categories + resume + history
+  ├─ _call_model_streaming() → streams tokens from HF Inference API, resolves tool calls
+  ├─ _parse_score()     → extracts hidden <!--SCORE:N--> tags from responses
+  ├─ Tools: fetch_url, web_search, save_session
+  └─ Whisper (faster-whisper, local)
+        │
+        ▼
+   HF Inference API (Qwen/Qwen2.5-72B-Instruct)
+```
+
+## Tools & Libraries
+
+| Tool | Purpose |
+|------|---------|
+| **Gradio** | Web UI framework with streaming chatbot, file upload, audio input |
+| **HuggingFace Inference API** | Remote LLM inference (Qwen2.5-72B-Instruct) |
+| **faster-whisper** | Local speech-to-text for voice input |
+| **DuckDuckGo Search** | Web search tool for company/role research |
+| **fpdf2** | PDF export of interview sessions |
+| **pypdf / python-docx** | Parse uploaded JD and resume files (PDF/DOCX) |
+
+## Features
+
+- **Technical-only questions** — no small talk, jumps straight into role-relevant technical questions
+- **Resume upload** — tailors questions to gaps between your experience and the JD
+- **Category focus areas** — multi-select: System Design, Coding/Algorithms, Domain Knowledge, API Design, Debugging, Architecture
+- **Answer scoring** — hidden 1-5 scoring per answer with running average display
+- **Model answer** — request an ideal example answer for any question
+- **Streaming responses** — real-time token streaming for all input methods
+- **Voice input** — browser microphone, transcribed locally with Whisper
+- **Session history** — save/load past sessions via browser localStorage
+- **Code block support** — markdown rendering with syntax highlighting
+- **Tool calling** — fetches JD from URLs, searches the web for company context
+- **PDF export** — download your full interview session
+- **Difficulty levels** — Easy / Medium / Hard
 
 **Model:** [`Qwen/Qwen2.5-72B-Instruct`](https://huggingface.co/Qwen/Qwen2.5-72B-Instruct) via HF Inference API (override with `HF_MODEL_ID`).
 
