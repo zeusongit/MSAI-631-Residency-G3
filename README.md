@@ -45,7 +45,7 @@ Browser (Gradio UI)
   └─ config.py                     → all prompts and settings
         │
         ▼
-   HF Inference API (Qwen/Qwen2.5-Coder-32B-Instruct)
+   HF Inference API (Qwen/Qwen2.5-72B-Instruct)
 ```
 
 ## Tools & Libraries
@@ -53,7 +53,7 @@ Browser (Gradio UI)
 | Tool | Purpose |
 |------|---------|
 | **Gradio** | Web UI framework with streaming chatbot, file upload, audio input |
-| **HuggingFace Inference API** | Remote LLM inference (Qwen2.5-Coder-32B-Instruct) |
+| **HuggingFace Inference API** | Remote LLM inference (Qwen2.5-72B-Instruct) |
 | **faster-whisper** | Local speech-to-text for voice input |
 | **Playwright** | Headless Chrome browser for scraping JS-rendered job sites |
 | **BeautifulSoup** | HTML parsing, JSON-LD extraction, CSS selector matching |
@@ -97,7 +97,7 @@ When you paste a job posting URL, the bot extracts the description using a multi
 - **PDF export** — download your full interview session
 - **Difficulty levels** — Easy / Medium / Hard
 
-**Model:** [`Qwen/Qwen2.5-Coder-32B-Instruct`](https://huggingface.co/Qwen/Qwen2.5-Coder-32B-Instruct) via HF Inference API (override with `HF_MODEL_ID`).
+**Model:** [`Qwen/Qwen2.5-72B-Instruct`](https://huggingface.co/Qwen/Qwen2.5-72B-Instruct) via HF Inference API (override with `HF_MODEL_ID`).
 
 ## Setup
 
@@ -140,7 +140,7 @@ Open the URL Gradio prints (usually `http://127.0.0.1:7860`).
 | Variable | Purpose | Default |
 |----------|---------|---------|
 | `HUGGING_FACE_HUB_TOKEN` | HF API token | (required) |
-| `HF_MODEL_ID` | Override chat model | `Qwen/Qwen2.5-Coder-32B-Instruct` |
+| `HF_MODEL_ID` | Override chat model | `Qwen/Qwen2.5-72B-Instruct` |
 | `HF_SYSTEM_PROMPT` | Override the interview coach system prompt | (built-in) |
 | `HF_MAX_NEW_TOKENS` | Cap reply length | `1024` |
 | `HF_WHISPER_MODEL` | Whisper model size for voice input | `small` |
