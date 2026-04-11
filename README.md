@@ -1,6 +1,13 @@
-# HF chatbot — initial setup
+# Interview Prep Chatbot
 
-Small **Gradio + Transformers** chat UI using [`HuggingFaceTB/SmolLM2-360M-Instruct`](https://huggingface.co/HuggingFaceTB/SmolLM2-360M-Instruct) (CPU-friendly, Apache-2.0).
+**Gradio + Hugging Face** interview coaching bot. Paste a job description (or URL) and the bot conducts a tailored mock interview with technical and behavioral questions, evaluates your answers, asks follow-ups, and provides a session summary.
+
+**Features:**
+- Tool calling — fetches JD from URLs, searches the web for company context, saves session summaries
+- Voice input — record answers via browser microphone, transcribed locally with Whisper
+- Adaptive follow-ups — probes deeper before moving to the next topic
+
+**Model:** [`Qwen/Qwen2.5-72B-Instruct`](https://huggingface.co/Qwen/Qwen2.5-72B-Instruct) via HF Inference API (override with `HF_MODEL_ID`).
 
 ## Dev environment (local)
 
@@ -33,17 +40,19 @@ Small **Gradio + Transformers** chat UI using [`HuggingFaceTB/SmolLM2-360M-Instr
    > ```
    > then `cd` back into this folder.
 
-3. **Install dependencies** (from this `hf-chatbot` directory):
+3. **Install dependencies** (from the `hf-chatbot` directory):
 
    ```bash
    pip install -r requirements.txt
    ```
 
-4. **(Optional) Hugging Face token** — only needed for **gated** models or higher rate limits. Do not commit it.
+4. **Hugging Face token** — required for the Inference API. Do not commit it.
 
    ```bash
-   export HUGGING_FACE_HUB_TOKEN="hf_..." # macOS/Linux
+   export HUGGING_FACE_HUB_TOKEN="hf_..."   # macOS/Linux
    ```
+
+   Get a token at [huggingface.co/settings/tokens](https://huggingface.co/settings/tokens). Enable the **"Make calls to the serverless Inference API"** permission.
 
 5. **Run the app:**
 
@@ -53,21 +62,32 @@ Small **Gradio + Transformers** chat UI using [`HuggingFaceTB/SmolLM2-360M-Instr
 
    Open the URL Gradio prints (usually `http://127.0.0.1:7860`).
 
-6. **Optional environment variables**
+6. **Environment variables**
 
    | Variable | Purpose |
    |----------|---------|
-   | `HF_MODEL_ID` | Override model (default: SmolLM2-360M-Instruct) |
-   | `HF_SYSTEM_PROMPT` | System / behavior instructions |
-   | `HF_MAX_NEW_TOKENS` | Cap reply length (default: 256) |
+   | `HUGGING_FACE_HUB_TOKEN` | HF API token (required) |
+   | `HF_MODEL_ID` | Override chat model (default: Qwen/Qwen2.5-72B-Instruct) |
+   | `HF_SYSTEM_PROMPT` | Override the interview coach system prompt |
+   | `HF_MAX_NEW_TOKENS` | Cap reply length (default: 1024) |
+   | `HF_WHISPER_MODEL` | Whisper model size for voice input (default: small) |
    | `GRADIO_SERVER_PORT` | Port (default: 7860) |
+
+## Usage
+
+1. Open the web UI in your browser.
+2. Paste a job description or a URL to a job posting in the text box and hit Send.
+3. The bot analyzes the JD, researches the company, and starts asking interview questions.
+4. Answer by typing or click **Voice input** to record via your microphone.
+5. After each answer you get feedback and follow-up questions.
+6. Say "done" to get a session summary with strengths and areas to improve.
 
 ## Hugging Face Space (host the same app)
 
 1. Log in at [huggingface.co](https://huggingface.co) and create a **New Space** (SDK: **Gradio**).
-2. Upload **`app.py`** and **`requirements.txt`** from this folder to the Space repo (web UI “Add file”, or Git clone/push).
-3. **Hardware:** start with **CPU**; upgrade to free GPU only if the Space supports it and your model needs it.
-4. For gated models, add a **Space secret** (Settings → Secrets) named `HUGGING_FACE_HUB_TOKEN` with your token.
+2. Upload **`app.py`** and **`requirements.txt`** from the `hf-chatbot` folder to the Space repo.
+3. **Hardware:** start with **CPU** — inference happens via the API, not locally (only Whisper runs locally).
+4. Add a **Space secret** named `HUGGING_FACE_HUB_TOKEN` with your token.
 
 ## Git
 
