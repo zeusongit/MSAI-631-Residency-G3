@@ -170,6 +170,28 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_resume",
+            "description": (
+                "Search the candidate's uploaded resume for relevant experience, skills, or projects. "
+                "Call this before asking about any specific skill, technology, or domain to see what "
+                "the candidate has listed. Examples: search_resume('Python projects'), "
+                "search_resume('distributed systems experience'), search_resume('leadership roles')."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Skill, technology, or experience area to look up in the resume",
+                    }
+                },
+                "required": ["query"],
+            },
+        },
+    },
 ]
 
 # ── Tool implementations ────────────────────────────────────────────────────
@@ -217,6 +239,7 @@ _TOOL_FUNCTIONS = {
     "fetch_url": _fetch_url,
     "web_search": _web_search,
     "save_session": _save_session,
+    "search_resume": _search_resume,
 }
 
 
@@ -289,6 +312,82 @@ def _transcribe_audio(audio_tuple) -> str:
     finally:
         os.unlink(tmp_path)
 
+# ── RAG (Resume vector store) ────────────────────────────────────────────────
+
+_rag_embedder = None
+_rag_chroma_client = None
+_rag_collection = None
+
+
+def _get_rag_embedder():
+    global _rag_embedder
+    if _rag_embedder is None:
+        from sentence_transformers import SentenceTransformer
+        _rag_embedder = SentenceTransformer("BAAI/bge-small-en-v1.5")
+    return _rag_embedder
+
+
+def _chunk_text(text: str, size: int = 400, overlap: int = 80) -> list[str]:
+    """Split text into overlapping fixed-size chunks."""
+    chunks, start = [], 0
+    while start < len(text):
+        chunks.append(text[start : start + size].strip())
+        start += size - overlap
+    return [c for c in chunks if c]
+
+
+def build_resume_index(resume_text: str) -> str:
+    """Chunk the resume, embed it, and store in an in-memory ChromaDB collection."""
+    global _rag_chroma_client, _rag_collection
+    try:
+        import chromadb
+        if _rag_chroma_client is None:
+            _rag_chroma_client = chromadb.Client()
+        try:
+            _rag_chroma_client.delete_collection("resume")
+        except Exception:
+            pass
+        _rag_collection = _rag_chroma_client.create_collection("resume")
+        chunks = _chunk_text(resume_text)
+        if not chunks:
+            return "Resume appears to be empty."
+        embeddings = _get_rag_embedder().encode(chunks).tolist()
+        _rag_collection.add(
+            documents=chunks,
+            embeddings=embeddings,
+            ids=[str(i) for i in range(len(chunks))],
+        )
+        return (
+            f"Resume indexed ({len(chunks)} chunks). "
+            "The coach will now call search_resume before asking about specific skills."
+        )
+    except ImportError:
+        return (
+            "RAG dependencies not installed (sentence-transformers, chromadb). "
+            "Resume will be passed as plain text instead."
+        )
+    except Exception as e:
+        return f"Error indexing resume: {e}"
+
+
+def _search_resume(query: str) -> str:
+    """Retrieve the most relevant resume chunks for a given query."""
+    if _rag_collection is None:
+        return "No resume has been uploaded and indexed yet."
+    try:
+        n = min(3, _rag_collection.count())
+        if n == 0:
+            return "Resume index is empty."
+        q_emb = _get_rag_embedder().encode([query]).tolist()
+        results = _rag_collection.query(query_embeddings=q_emb, n_results=n)
+        docs = results.get("documents", [[]])[0]
+        if not docs:
+            return "No matching resume content found."
+        return "\n---\n".join(docs)
+    except Exception as e:
+        return f"Resume search error: {e}"
+
+
 # ── Chat logic ──────────────────────────────────────────────────────────────
 
 
@@ -310,11 +409,16 @@ def _build_messages(
         if cat_instructions:
             prompt += "\n\n## Focus areas:\n" + cat_instructions
     if resume_text:
+        # Resume is RAG-indexed; instruct the model to retrieve rather than read the full text.
         prompt += (
-            "\n\n## Candidate resume:\n"
-            "The candidate has provided their resume. Use it to tailor questions to "
-            "gaps between their experience and the job requirements. Here it is:\n\n"
-            + resume_text
+            "\n\n## Candidate Resume (RAG-indexed):\n"
+            "The candidate has uploaded their resume and it is indexed for semantic search. "
+            "Before asking about any skill, technology, project, or experience area, "
+            "call `search_resume` with a relevant query to retrieve what the candidate has listed. "
+            "Examples: search_resume('Python'), search_resume('system design experience'), "
+            "search_resume('leadership or management'). "
+            "Use the retrieved content to probe gaps between their background and the job requirements, "
+            "or to ask deeper follow-up questions grounded in their actual experience."
         )
     messages.append({"role": "system", "content": prompt})
     for item in history:
@@ -542,12 +646,18 @@ def main() -> None:
             )
             upload_btn = gr.Button("Use this file")
 
-        with gr.Accordion("Upload your resume (optional)", open=False):
+        with gr.Accordion("Upload your resume (optional — enables RAG)", open=False):
             resume_upload = gr.File(
                 label="Upload resume (PDF, DOCX, or TXT)",
                 file_types=[".pdf", ".docx", ".doc", ".txt"],
             )
-            resume_btn = gr.Button("Use this resume")
+            resume_btn = gr.Button("Index resume")
+            resume_status = gr.Textbox(
+                value="",
+                label="Index status",
+                interactive=False,
+                placeholder="Upload a resume and click 'Index resume' to enable RAG retrieval.",
+            )
 
         # ── Chat area ──────────────────────────────────────────────────
 
@@ -578,16 +688,17 @@ def main() -> None:
 
         def _on_resume_upload(file):
             if file is None:
-                return ""
+                return "", ""
             text = _extract_file_text(file)
             if text.startswith("Error"):
-                return ""
-            return text
+                return "", text
+            status = build_resume_index(text)
+            return text, status
 
         resume_btn.click(
             _on_resume_upload,
             [resume_upload],
-            [resume_state],
+            [resume_state, resume_status],
         )
 
         # ── File upload handler ─────────────────────────────────────────
