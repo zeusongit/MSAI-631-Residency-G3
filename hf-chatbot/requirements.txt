@@ -6,10 +6,6 @@ gradio>=4.44.0
 huggingface_hub>=0.24.0
 safetensors>=0.4.0
 
-# RAG: resume vector indexing and semantic retrieval
-sentence-transformers>=2.7.0
-chromadb>=0.5.0
-
 # Interview prep: tool calling, voice input, web search, file parsing, export
 requests>=2.31.0
 duckduckgo-search>=6.0.0

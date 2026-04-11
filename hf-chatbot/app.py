@@ -6,15 +6,16 @@ tailored technical and behavioral interview questions, evaluates answers
 with constructive feedback, and asks follow-up questions before moving on.
 
 Supports voice input via browser microphone (transcribed with Whisper),
-file upload (PDF/DOCX/TXT), difficulty selection, answer timing, and
-session export as PDF.
+file upload (PDF/DOCX/TXT), difficulty selection, answer timing, session
+export as PDF, dynamic UI (MCQ radio buttons, rating sliders), streaming
+responses, per-answer scoring, resume upload, category focus, and a
+"show model answer" button.
 
 Set HUGGING_FACE_HUB_TOKEN for API access. See README for all env vars.
 """
 
 from __future__ import annotations
 
-import io
 import json
 import os
 import re
@@ -122,6 +123,25 @@ or responding to commands like "skip" or "done".
 When discussing code, ALWAYS use markdown fenced code blocks with the language specified, \
 e.g. ```python. When asking coding questions, encourage the candidate to write code in \
 their response.
+
+## Dynamic UI hints — FOLLOW EXACTLY:
+After EVERY message that ends with a direct question to the user, append a single \
+`<ui_hint>` tag on a new line at the very end (after the SCORE tag if present). \
+Choose the type that best fits:
+
+- Open-ended (default): <ui_hint>{"type": "open"}</ui_hint>
+- Multiple choice — 4 distinct, plausible options: \
+<ui_hint>{"type": "mcq", "options": ["Option A", "Option B", "Option C", "Option D"]}</ui_hint>
+- Self-rating or confidence check: \
+<ui_hint>{"type": "rating", "min": 1, "max": 5, "label": "How confident are you? (1=not at all, 5=very)"}</ui_hint>
+
+Rules:
+- ONLY append a hint when your message ends with a direct question
+- Do NOT append a hint on pure feedback, acknowledgements, or summary messages
+- For MCQ: generate realistic, clearly distinct options relevant to the question
+- Use MCQ for factual/knowledge questions where a few clear answers exist
+- Use rating for confidence checks, self-assessments, or "how well do you know X?"
+- Use open for everything else (scenario, explanation, coding questions)
 """)
 
 # ── Tool definitions (OpenAI-compatible format) ─────────────────────────────
@@ -167,28 +187,6 @@ TOOLS = [
                     "content": {"type": "string", "description": "Content to write to the file"},
                 },
                 "required": ["filepath", "content"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "search_resume",
-            "description": (
-                "Search the candidate's uploaded resume for relevant experience, skills, or projects. "
-                "Call this before asking about any specific skill, technology, or domain to see what "
-                "the candidate has listed. Examples: search_resume('Python projects'), "
-                "search_resume('distributed systems experience'), search_resume('leadership roles')."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "Skill, technology, or experience area to look up in the resume",
-                    }
-                },
-                "required": ["query"],
             },
         },
     },
@@ -239,7 +237,6 @@ _TOOL_FUNCTIONS = {
     "fetch_url": _fetch_url,
     "web_search": _web_search,
     "save_session": _save_session,
-    "search_resume": _search_resume,
 }
 
 
@@ -294,13 +291,11 @@ def _transcribe_audio(audio_tuple) -> str:
     sample_rate, audio_data = audio_tuple
     if audio_data is None or len(audio_data) == 0:
         return ""
-    # Normalise to float32 mono
     audio = audio_data.astype(np.float32)
     if audio.ndim > 1:
         audio = audio.mean(axis=1)
     if audio.max() > 1.0:
         audio = audio / 32768.0
-    # Write to a temp WAV for faster-whisper
     import soundfile as sf
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
         sf.write(tmp.name, audio, sample_rate)
@@ -312,81 +307,82 @@ def _transcribe_audio(audio_tuple) -> str:
     finally:
         os.unlink(tmp_path)
 
-# ── RAG (Resume vector store) ────────────────────────────────────────────────
+# ── Response tag parsing ─────────────────────────────────────────────────────
 
-_rag_embedder = None
-_rag_chroma_client = None
-_rag_collection = None
-
-
-def _get_rag_embedder():
-    global _rag_embedder
-    if _rag_embedder is None:
-        from sentence_transformers import SentenceTransformer
-        _rag_embedder = SentenceTransformer("BAAI/bge-small-en-v1.5")
-    return _rag_embedder
+_UI_HINT_RE = re.compile(r"<ui_hint>(.*?)</ui_hint>", re.DOTALL)
+_SCORE_RE = re.compile(r"<!--SCORE:(\d)-->")
 
 
-def _chunk_text(text: str, size: int = 400, overlap: int = 80) -> list[str]:
-    """Split text into overlapping fixed-size chunks."""
-    chunks, start = [], 0
-    while start < len(text):
-        chunks.append(text[start : start + size].strip())
-        start += size - overlap
-    return [c for c in chunks if c]
+def _parse_tags(text: str) -> tuple[str, dict, int | None]:
+    """
+    Strip <ui_hint> and <!--SCORE:N--> tags from model reply.
+    Returns (clean_text, hint_dict, score_or_None).
+    """
+    # Parse score
+    score: int | None = None
+    score_match = _SCORE_RE.search(text)
+    if score_match:
+        score = max(1, min(5, int(score_match.group(1))))
+        text = text[:score_match.start()].rstrip()
 
-
-def build_resume_index(resume_text: str) -> str:
-    """Chunk the resume, embed it, and store in an in-memory ChromaDB collection."""
-    global _rag_chroma_client, _rag_collection
-    try:
-        import chromadb
-        if _rag_chroma_client is None:
-            _rag_chroma_client = chromadb.Client()
+    # Parse ui_hint
+    hint: dict = {"type": "open"}
+    hint_match = _UI_HINT_RE.search(text)
+    if hint_match:
         try:
-            _rag_chroma_client.delete_collection("resume")
-        except Exception:
-            pass
-        _rag_collection = _rag_chroma_client.create_collection("resume")
-        chunks = _chunk_text(resume_text)
-        if not chunks:
-            return "Resume appears to be empty."
-        embeddings = _get_rag_embedder().encode(chunks).tolist()
-        _rag_collection.add(
-            documents=chunks,
-            embeddings=embeddings,
-            ids=[str(i) for i in range(len(chunks))],
-        )
+            hint = json.loads(hint_match.group(1).strip())
+        except (json.JSONDecodeError, ValueError):
+            hint = {"type": "open"}
+        text = _UI_HINT_RE.sub("", text).strip()
+
+    return text.strip(), hint, score
+
+
+def _input_visibility(hint: dict) -> tuple:
+    """
+    Return gr.update() tuples for all dynamic input rows/components.
+    Order: (text_row, mcq_row, mcq_radio, rating_row, rating_slider)
+
+    The text input row is ALWAYS visible so the conversation can always
+    continue. MCQ and rating rows appear above it as additional options.
+    """
+    qtype = hint.get("type", "open")
+    if qtype == "mcq":
+        options = hint.get("options") or []
+        if options:
+            return (
+                gr.update(visible=True),
+                gr.update(visible=True),
+                gr.update(choices=options, value=None),
+                gr.update(visible=False),
+                gr.update(),
+            )
+    if qtype == "rating":
         return (
-            f"Resume indexed ({len(chunks)} chunks). "
-            "The coach will now call search_resume before asking about specific skills."
+            gr.update(visible=True),
+            gr.update(visible=False),
+            gr.update(choices=[], value=None),
+            gr.update(visible=True),
+            gr.update(
+                minimum=hint.get("min", 1),
+                maximum=hint.get("max", 5),
+                value=hint.get("min", 1),
+                label=hint.get("label", "Your rating"),
+            ),
         )
-    except ImportError:
-        return (
-            "RAG dependencies not installed (sentence-transformers, chromadb). "
-            "Resume will be passed as plain text instead."
-        )
-    except Exception as e:
-        return f"Error indexing resume: {e}"
+    # default / open / mcq with no options: text input only
+    return (
+        gr.update(visible=True),
+        gr.update(visible=False),
+        gr.update(choices=[], value=None),
+        gr.update(visible=False),
+        gr.update(),
+    )
 
 
-def _search_resume(query: str) -> str:
-    """Retrieve the most relevant resume chunks for a given query."""
-    if _rag_collection is None:
-        return "No resume has been uploaded and indexed yet."
-    try:
-        n = min(3, _rag_collection.count())
-        if n == 0:
-            return "Resume index is empty."
-        q_emb = _get_rag_embedder().encode([query]).tolist()
-        results = _rag_collection.query(query_embeddings=q_emb, n_results=n)
-        docs = results.get("documents", [[]])[0]
-        if not docs:
-            return "No matching resume content found."
-        return "\n---\n".join(docs)
-    except Exception as e:
-        return f"Resume search error: {e}"
-
+def _no_change_visibility() -> tuple:
+    """gr.update() tuples that don't change any input row visibility."""
+    return (gr.update(), gr.update(), gr.update(), gr.update(), gr.update())
 
 # ── Chat logic ──────────────────────────────────────────────────────────────
 
@@ -409,16 +405,11 @@ def _build_messages(
         if cat_instructions:
             prompt += "\n\n## Focus areas:\n" + cat_instructions
     if resume_text:
-        # Resume is RAG-indexed; instruct the model to retrieve rather than read the full text.
         prompt += (
-            "\n\n## Candidate Resume (RAG-indexed):\n"
-            "The candidate has uploaded their resume and it is indexed for semantic search. "
-            "Before asking about any skill, technology, project, or experience area, "
-            "call `search_resume` with a relevant query to retrieve what the candidate has listed. "
-            "Examples: search_resume('Python'), search_resume('system design experience'), "
-            "search_resume('leadership or management'). "
-            "Use the retrieved content to probe gaps between their background and the job requirements, "
-            "or to ask deeper follow-up questions grounded in their actual experience."
+            "\n\n## Candidate resume:\n"
+            "The candidate has provided their resume. Use it to tailor questions to "
+            "gaps between their experience and the job requirements. Here it is:\n\n"
+            + resume_text
         )
     messages.append({"role": "system", "content": prompt})
     for item in history:
@@ -464,12 +455,10 @@ def _call_model_streaming(messages: list[dict], client: InferenceClient):
         )
         msg = response.choices[0].message
 
-    # If tool resolution produced a final text answer, yield it
     if msg.content:
         yield msg.content.strip()
         return
 
-    # Stream the final response (no tool calls pending)
     stream = client.chat.completions.create(
         model=MODEL_ID,
         messages=messages,
@@ -486,7 +475,7 @@ def _call_model_streaming(messages: list[dict], client: InferenceClient):
 
 
 def _call_model(messages: list[dict], client: InferenceClient) -> str:
-    """Non-streaming model call. Used for model-answer requests."""
+    """Non-streaming model call (used for model-answer requests)."""
     result = ""
     for partial in _call_model_streaming(messages, client):
         result = partial
@@ -503,20 +492,7 @@ def _get_client() -> InferenceClient:
         _client = InferenceClient(token=HF_TOKEN)
     return _client
 
-
-def _respond(
-    message: str,
-    history: list[dict],
-    difficulty: str,
-    categories: list[str] | None = None,
-    resume_text: str = "",
-) -> str:
-    """Generate the next assistant reply."""
-    messages = _build_messages(history, difficulty, categories, resume_text)
-    messages.append({"role": "user", "content": message})
-    return _call_model(messages, _get_client())
-
-# ── Answer timer helpers ────────────────────────────────────────────────────
+# ── Answer timer / score helpers ─────────────────────────────────────────────
 
 
 def _format_duration(seconds: float) -> str:
@@ -526,15 +502,6 @@ def _format_duration(seconds: float) -> str:
         return f"{m}m {s}s"
     return f"{s}s"
 
-
-def _parse_score(text: str) -> tuple[str, int | None]:
-    """Extract <!--SCORE:N--> from the end of a response. Returns (clean_text, score)."""
-    match = re.search(r"<!--SCORE:(\d)-->", text)
-    if match:
-        score = int(match.group(1))
-        clean = text[:match.start()].rstrip()
-        return clean, max(1, min(5, score))
-    return text, None
 
 def _fmt_avg(scores: list) -> str:
     """Format the average score for display."""
@@ -575,7 +542,6 @@ def _export_chat_pdf(history: list[dict]) -> str | None:
         pdf.set_font("Helvetica", "B", 10)
         pdf.cell(0, 6, f"{label}:", ln=True)
         pdf.set_font("Helvetica", size=10)
-        # Encode to latin-1 for fpdf, replacing unsupported chars
         safe_text = content.encode("latin-1", errors="replace").decode("latin-1")
         pdf.multi_cell(0, 5, safe_text)
         pdf.ln(3)
@@ -646,28 +612,47 @@ def main() -> None:
             )
             upload_btn = gr.Button("Use this file")
 
-        with gr.Accordion("Upload your resume (optional — enables RAG)", open=False):
+        with gr.Accordion("Upload your resume (optional)", open=False):
             resume_upload = gr.File(
                 label="Upload resume (PDF, DOCX, or TXT)",
                 file_types=[".pdf", ".docx", ".doc", ".txt"],
             )
-            resume_btn = gr.Button("Index resume")
-            resume_status = gr.Textbox(
-                value="",
-                label="Index status",
-                interactive=False,
-                placeholder="Upload a resume and click 'Index resume' to enable RAG retrieval.",
-            )
+            resume_btn = gr.Button("Use this resume")
 
         # ── Chat area ──────────────────────────────────────────────────
 
         chatbot = gr.Chatbot(height=450, render_markdown=True)
-        state = gr.State([])  # chat history as list[dict]
-        question_ts = gr.State(0.0)  # timestamp when last bot message was shown
-        scores = gr.State([])  # list of int scores
-        resume_state = gr.State("")  # resume text
+        state = gr.State([])        # chat history as list[dict]
+        question_ts = gr.State(0.0) # timestamp when last bot message was shown
+        scores = gr.State([])       # list of int scores
+        resume_state = gr.State("") # resume text
 
-        with gr.Row():
+        # ── Dynamic answer inputs ───────────────────────────────────────
+        # Text input is ALWAYS visible. MCQ and rating rows appear above
+        # it as additional options when the model requests them.
+
+        with gr.Row(visible=False) as mcq_input_row:
+            mcq_radio = gr.Radio(
+                choices=[],
+                label="Choose the best answer",
+                interactive=True,
+                scale=4,
+            )
+            mcq_btn = gr.Button("Submit Answer", variant="primary", scale=1)
+
+        with gr.Row(visible=False) as rating_input_row:
+            rating_slider = gr.Slider(
+                minimum=1,
+                maximum=5,
+                value=3,
+                step=1,
+                label="Your rating",
+                interactive=True,
+                scale=4,
+            )
+            rating_btn = gr.Button("Submit Rating", variant="primary", scale=1)
+
+        with gr.Row(visible=True) as text_input_row:
             txt = gr.Textbox(
                 placeholder="Type your answer (or paste a JD / URL to begin). Code snippets supported with markdown.",
                 show_label=False,
@@ -684,152 +669,166 @@ def main() -> None:
             audio = gr.Audio(sources=["microphone"], type="numpy", label="Record your answer")
             voice_btn = gr.Button("Transcribe & Send")
 
-        # ── Resume upload handler ──────────────────────────────────────
+        # ── Shared output list ───────────────────────────────────────────
+        # (chatbot, state, txt, timer_display, question_ts, scores,
+        #  score_display, text_input_row, mcq_input_row, mcq_radio,
+        #  rating_input_row, rating_slider)
+
+        _outputs = [
+            chatbot, state, txt, timer_display, question_ts, scores, score_display,
+            text_input_row, mcq_input_row, mcq_radio, rating_input_row, rating_slider,
+        ]
+
+        # ── Resume upload handler ────────────────────────────────────────
 
         def _on_resume_upload(file):
             if file is None:
-                return "", ""
+                return ""
             text = _extract_file_text(file)
-            if text.startswith("Error"):
-                return "", text
-            status = build_resume_index(text)
-            return text, status
+            return "" if text.startswith("Error") else text
 
-        resume_btn.click(
-            _on_resume_upload,
-            [resume_upload],
-            [resume_state, resume_status],
-        )
+        resume_btn.click(_on_resume_upload, [resume_upload], [resume_state])
 
-        # ── File upload handler ─────────────────────────────────────────
+        # ── Streaming helper ─────────────────────────────────────────────
 
-        def _on_file_upload(file, history: list[dict], diff: str,
-                            score_list: list, cats: list[str], resume_txt: str):
-            if file is None:
-                yield history, history, "", 0.0, score_list, _fmt_avg(score_list)
-                return
-            text = _extract_file_text(file)
-            if text.startswith("Error"):
-                history = history + [{"role": "assistant", "content": text}]
-                yield history, history, "", 0.0, score_list, _fmt_avg(score_list)
-                return
-            user_msg = f"Here is the job description:\n\n{text}"
-            history = history + [{"role": "user", "content": user_msg}]
+        def _stream_reply(user_msg, history, diff, ts, score_list, cats, resume_txt,
+                          clear_audio=False):
+            """
+            Shared generator for text/voice/MCQ/rating/file submit handlers.
+            Yields tuples matching _outputs on each streaming chunk, then a
+            final tuple with tags stripped and input visibility updated.
+            """
+            duration_str = ""
+            if ts > 0 and history and history[-1].get("role") == "assistant":
+                duration_str = _format_duration(time.time() - ts)
+
             messages = _build_messages(history[:-1], diff, cats, resume_txt)
             messages.append({"role": "user", "content": user_msg})
 
             partial_history = history + [{"role": "assistant", "content": ""}]
+
             for partial_text in _call_model_streaming(messages, _get_client()):
                 partial_history[-1]["content"] = partial_text
-                yield (partial_history, partial_history, "", time.time(),
-                       score_list, _fmt_avg(score_list))
+                yield (
+                    partial_history, partial_history, "", duration_str, time.time(),
+                    score_list, _fmt_avg(score_list),
+                ) + _no_change_visibility()
 
+            # Final chunk: strip tags and update input UI
             final_text = partial_history[-1]["content"]
-            clean_text, score = _parse_score(final_text)
+            clean_text, hint, score = _parse_tags(final_text)
             partial_history[-1]["content"] = clean_text
             if score is not None:
                 score_list = score_list + [score]
-            yield (partial_history, partial_history, "", time.time(),
-                   score_list, _fmt_avg(score_list))
+
+            yield (
+                partial_history, partial_history, "", duration_str, time.time(),
+                score_list, _fmt_avg(score_list),
+            ) + _input_visibility(hint)
+
+        # ── File upload handler ─────────────────────────────────────────
+
+        def _on_file_upload(file, history, diff, ts, score_list, cats, resume_txt):
+            if file is None:
+                yield (history, history, "", "", ts, score_list, _fmt_avg(score_list)) + _no_change_visibility()
+                return
+            text = _extract_file_text(file)
+            if text.startswith("Error"):
+                err_history = history + [{"role": "assistant", "content": text}]
+                yield (err_history, err_history, "", "", ts, score_list, _fmt_avg(score_list)) + _no_change_visibility()
+                return
+            user_msg = f"Here is the job description:\n\n{text}"
+            history = history + [{"role": "user", "content": user_msg}]
+            yield from _stream_reply(user_msg, history, diff, 0.0, score_list, cats, resume_txt)
 
         upload_btn.click(
             _on_file_upload,
-            [file_upload, state, difficulty, scores, categories, resume_state],
-            [chatbot, state, timer_display, question_ts, scores, score_display],
+            [file_upload, state, difficulty, question_ts, scores, categories, resume_state],
+            _outputs,
         )
 
         # ── Text submit ─────────────────────────────────────────────────
 
-        def _on_text_submit(message: str, history: list[dict], diff: str, ts: float,
-                            score_list: list, cats: list[str], resume_txt: str):
+        def _on_text_submit(message, history, diff, ts, score_list, cats, resume_txt):
             if not message.strip():
-                yield history, history, "", "", ts, score_list, _fmt_avg(score_list)
+                yield (history, history, "", "", ts, score_list, _fmt_avg(score_list)) + _no_change_visibility()
                 return
-            duration_str = ""
-            if ts > 0 and history and history[-1].get("role") == "assistant":
-                elapsed = time.time() - ts
-                duration_str = _format_duration(elapsed)
-
             history = history + [{"role": "user", "content": message}]
-            messages = _build_messages(history[:-1], diff, cats, resume_txt)
-            messages.append({"role": "user", "content": message})
-
-            partial_history = history + [{"role": "assistant", "content": ""}]
-            for partial_text in _call_model_streaming(messages, _get_client()):
-                partial_history[-1]["content"] = partial_text
-                yield (partial_history, partial_history, "", duration_str, time.time(),
-                       score_list, _fmt_avg(score_list))
-
-            final_text = partial_history[-1]["content"]
-            clean_text, score = _parse_score(final_text)
-            partial_history[-1]["content"] = clean_text
-            if score is not None:
-                score_list = score_list + [score]
-            yield (partial_history, partial_history, "", duration_str, time.time(),
-                   score_list, _fmt_avg(score_list))
+            yield from _stream_reply(message, history, diff, ts, score_list, cats, resume_txt)
 
         txt.submit(
             _on_text_submit,
             [txt, state, difficulty, question_ts, scores, categories, resume_state],
-            [chatbot, state, txt, timer_display, question_ts, scores, score_display],
+            _outputs,
         )
         send_btn.click(
             _on_text_submit,
             [txt, state, difficulty, question_ts, scores, categories, resume_state],
-            [chatbot, state, txt, timer_display, question_ts, scores, score_display],
+            _outputs,
+        )
+
+        # ── MCQ submit ──────────────────────────────────────────────────
+
+        def _on_mcq_submit(selection, history, diff, ts, score_list, cats, resume_txt):
+            if not selection:
+                yield (history, history, "", "", ts, score_list, _fmt_avg(score_list)) + _no_change_visibility()
+                return
+            history = history + [{"role": "user", "content": selection}]
+            yield from _stream_reply(selection, history, diff, ts, score_list, cats, resume_txt)
+
+        mcq_btn.click(
+            _on_mcq_submit,
+            [mcq_radio, state, difficulty, question_ts, scores, categories, resume_state],
+            _outputs,
+        )
+
+        # ── Rating submit ───────────────────────────────────────────────
+
+        def _on_rating_submit(value, history, diff, ts, score_list, cats, resume_txt):
+            if value is None:
+                yield (history, history, "", "", ts, score_list, _fmt_avg(score_list)) + _no_change_visibility()
+                return
+            message = str(int(value))
+            history = history + [{"role": "user", "content": message}]
+            yield from _stream_reply(message, history, diff, ts, score_list, cats, resume_txt)
+
+        rating_btn.click(
+            _on_rating_submit,
+            [rating_slider, state, difficulty, question_ts, scores, categories, resume_state],
+            _outputs,
         )
 
         # ── Voice submit ────────────────────────────────────────────────
 
-        def _on_voice_submit(audio_data, history: list[dict], diff: str, ts: float,
-                             score_list: list, cats: list[str], resume_txt: str):
+        def _on_voice_submit(audio_data, history, diff, ts, score_list, cats, resume_txt):
             text = _transcribe_audio(audio_data)
             if not text:
-                yield history, history, None, "", ts, score_list, _fmt_avg(score_list)
+                yield (history, history, "", "", ts, score_list, _fmt_avg(score_list)) + _no_change_visibility()
                 return
-            duration_str = ""
-            if ts > 0 and history and history[-1].get("role") == "assistant":
-                elapsed = time.time() - ts
-                duration_str = _format_duration(elapsed)
-
             history = history + [{"role": "user", "content": f"[voice] {text}"}]
-            messages = _build_messages(history[:-1], diff, cats, resume_txt)
-            messages.append({"role": "user", "content": text})
-
-            partial_history = history + [{"role": "assistant", "content": ""}]
-            for partial_text in _call_model_streaming(messages, _get_client()):
-                partial_history[-1]["content"] = partial_text
-                yield (partial_history, partial_history, None, duration_str, time.time(),
-                       score_list, _fmt_avg(score_list))
-
-            final_text = partial_history[-1]["content"]
-            clean_text, score = _parse_score(final_text)
-            partial_history[-1]["content"] = clean_text
-            if score is not None:
-                score_list = score_list + [score]
-            yield (partial_history, partial_history, None, duration_str, time.time(),
-                   score_list, _fmt_avg(score_list))
+            yield from _stream_reply(text, history, diff, ts, score_list, cats, resume_txt)
 
         voice_btn.click(
             _on_voice_submit,
             [audio, state, difficulty, question_ts, scores, categories, resume_state],
-            [chatbot, state, audio, timer_display, question_ts, scores, score_display],
+            _outputs,
         )
 
         # ── Model answer ───────────────────────────────────────────────
 
-        def _on_model_answer(history: list[dict], diff: str, cats: list[str], resume_txt: str):
+        def _on_model_answer(history, diff, cats, resume_txt):
             if not history:
                 return history, history
             messages = _build_messages(history, diff, cats, resume_txt)
             messages.append({
                 "role": "user",
-                "content": "Give a strong, detailed model answer for the last technical question you asked. "
-                           "Format it as if you were the ideal candidate responding. Use code blocks if relevant.",
+                "content": (
+                    "Give a strong, detailed model answer for the last technical question you asked. "
+                    "Format it as if you were the ideal candidate responding. Use code blocks if relevant."
+                ),
             })
             reply = _call_model(messages, _get_client())
-            reply = f"**Model Answer:**\n\n{reply}"
-            history = history + [{"role": "assistant", "content": reply}]
+            history = history + [{"role": "assistant", "content": f"**Model Answer:**\n\n{reply}"}]
             return history, history
 
         model_answer_btn.click(
@@ -840,7 +839,7 @@ def main() -> None:
 
         # ── PDF export ──────────────────────────────────────────────────
 
-        def _on_export(history: list[dict]):
+        def _on_export(history):
             path = _export_chat_pdf(history)
             if path is None:
                 return gr.update(visible=False)
@@ -865,9 +864,7 @@ async function(history) {
 }
 """
 
-        save_session_btn.click(
-            None, [state], [session_dropdown], js=save_session_js
-        )
+        save_session_btn.click(None, [state], [session_dropdown], js=save_session_js)
 
         load_session_js = """
 async function(selected) {
@@ -883,9 +880,7 @@ async function(selected) {
 }
 """
 
-        load_session_btn.click(
-            None, [session_dropdown], [chatbot, state], js=load_session_js
-        )
+        load_session_btn.click(None, [session_dropdown], [chatbot, state], js=load_session_js)
 
         populate_sessions_js = """
 async function() {
