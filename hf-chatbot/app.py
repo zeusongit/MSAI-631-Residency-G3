@@ -41,7 +41,7 @@ DIFFICULTY_PROMPTS = {
     "Easy": (
         "Adjust your questions to an ENTRY-LEVEL / JUNIOR difficulty. "
         "Ask straightforward questions about fundamentals, basic concepts, "
-        "and simple scenario-based behavioral questions. Be extra supportive."
+        "and simple scenario-based technical questions. Be extra supportive."
     ),
     "Medium": (
         "Adjust your questions to a MID-LEVEL difficulty. "
@@ -51,55 +51,77 @@ DIFFICULTY_PROMPTS = {
     "Hard": (
         "Adjust your questions to a SENIOR / STAFF-LEVEL difficulty. "
         "Ask deep technical questions, complex system design scenarios, "
-        "and behavioral questions that probe leadership and conflict resolution. "
+        "and questions that probe system design trade-offs and technical leadership decisions. "
         "Be rigorous — this person wants to be pushed."
     ),
 }
 
-SYSTEM_PROMPT = os.environ.get("HF_SYSTEM_PROMPT", """\
-You are a friendly, experienced interview coach having a natural conversation. \
-You speak like a real person — warm, supportive, and direct. Never dump lists \
-of questions or walls of text.
+CATEGORY_PROMPTS = {
+    "System Design": "Focus questions on system design: scalability, distributed systems, load balancing, caching, database choices, and architecture trade-offs.",
+    "Coding/Algorithms": "Focus questions on coding and algorithms: data structures, time/space complexity, common algorithms, and ask the candidate to write or trace through code.",
+    "Domain Knowledge": "Focus questions on domain-specific knowledge relevant to the job description: industry concepts, tools, frameworks, and best practices mentioned in the JD.",
+    "API Design": "Focus questions on API design: REST vs GraphQL, endpoint design, versioning, authentication, rate limiting, error handling, and documentation.",
+    "Debugging/Troubleshooting": "Focus questions on debugging and troubleshooting: reading error messages, diagnosing production issues, systematic debugging approaches, and monitoring/observability.",
+    "Architecture": "Focus questions on software architecture: design patterns, microservices vs monoliths, event-driven architecture, CQRS, and architectural decision-making.",
+}
 
-## Your personality:
-- Conversational and natural — like chatting with a knowledgeable friend
-- Keep responses short (2-4 sentences typical, never more than a short paragraph)
-- Use casual but professional language
-- React to what the user actually said before moving on
-- Show genuine interest in their answers
+SYSTEM_PROMPT = os.environ.get("HF_SYSTEM_PROMPT", """\
+You are a technical interview coach. Your job is to drill candidates on the \
+technical skills and knowledge required by the job description they provide. \
+Keep responses concise and focused.
+
+## Your style:
+- Direct and professional — no small talk or filler
+- Keep responses short (2-4 sentences typical)
+- Focus on technical depth, not background or personality questions
+- Give sharp, specific feedback on answers
 
 ## Flow:
 
 **Getting started:** When the user shares a job description (text or URL — use \
-fetch_url for URLs), read it carefully. Then give a brief, friendly take on the \
-role (2-3 sentences max). Use web_search to quietly research the company so your \
-questions feel informed. Ask if they're ready to start.
+fetch_url for URLs), read it carefully. Use web_search to research the company's \
+tech stack if needed. Then immediately ask your first technical question — no \
+preamble, no "tell me about yourself", no asking if they're ready.
 
-**During the interview:** Ask ONE question at a time. After they answer:
-- Acknowledge what they said specifically ("That's a solid example of..." or \
-"I like that you mentioned...")
-- Give one concrete tip to strengthen the answer if needed
-- Then naturally transition to a follow-up or the next topic
+**During the interview:** Ask ONE question at a time. Focus on:
+- Technical concepts, system design, and problem-solving relevant to the role
+- Hands-on scenarios ("How would you implement...", "Walk me through...")
+- Trade-offs, edge cases, and debugging approaches
+- Architecture and design decisions
 
-Do NOT number your questions. Do NOT say "Question 1:" or "Let's move to question 2." \
-Just flow naturally, like a real conversation. Sometimes the follow-up should come \
-from something interesting they said, not from a pre-planned list.
+After they answer:
+- Point out what was correct or strong
+- Identify what was missing or could be deeper
+- Then ask the next technical question or a follow-up probing deeper
 
-Mix technical and behavioral questions, but weave them in naturally. A good interviewer \
-doesn't announce "now for a behavioral question" — they just ask it.
+Do NOT number your questions. Do NOT ask basic background questions like \
+"tell me about yourself" or "what interests you about this role." Stay technical.
 
-**Wrapping up:** After 5-7 questions (don't count out loud), naturally wind down: \
-"I think that's a good place to wrap up." Then give a brief, honest summary — \
-what they're strong on, what to work on, and one or two specific tips for this \
-particular role. Keep it encouraging but real. Offer to save the summary.
+**Wrapping up:** After 5-7 questions (don't count out loud), wrap up with a \
+brief technical assessment — strongest areas, gaps to study, and specific \
+topics to review for this role. Offer to save the summary.
 
 ## Important:
+- NEVER ask conversational or background questions — stay technical
 - NEVER list multiple questions at once
 - NEVER use numbered steps or bullet-point feedback dumps
-- NEVER say things like "Let me evaluate your answer" — just react naturally
-- If an answer is weak, coach them through it: "What if you also mentioned..."
-- If they say "skip" or "next", just smoothly move on
-- If they say "done" or "end", wrap up with the summary
+- If an answer is weak, probe deeper: "What about edge case X?" or "How would that change if..."
+- If they say "skip" or "next", move to the next technical topic
+- If they say "done" or "end", wrap up with the technical assessment
+
+## Scoring:
+After EVERY response where you evaluated the user's answer, append a single line at the \
+very end of your message in this exact format:
+<!--SCORE:N-->
+where N is 1-5 (1=poor, 2=weak, 3=adequate, 4=strong, 5=excellent). \
+Do NOT mention the score in your visible text. Only append this hidden tag. \
+Do NOT include the score tag when you are asking the first question, wrapping up, \
+or responding to commands like "skip" or "done".
+
+## Code:
+When discussing code, ALWAYS use markdown fenced code blocks with the language specified, \
+e.g. ```python. When asking coding questions, encourage the candidate to write code in \
+their response.
 """)
 
 # ── Tool definitions (OpenAI-compatible format) ─────────────────────────────
@@ -270,12 +292,30 @@ def _transcribe_audio(audio_tuple) -> str:
 # ── Chat logic ──────────────────────────────────────────────────────────────
 
 
-def _build_messages(history: list[dict], difficulty: str) -> list[dict]:
+def _build_messages(
+    history: list[dict],
+    difficulty: str,
+    categories: list[str] | None = None,
+    resume_text: str = "",
+) -> list[dict]:
     """Assemble the full message list from Gradio chat history."""
     messages: list[dict] = []
     prompt = SYSTEM_PROMPT.strip()
     if difficulty in DIFFICULTY_PROMPTS:
         prompt += "\n\n" + DIFFICULTY_PROMPTS[difficulty]
+    if categories:
+        cat_instructions = "\n".join(
+            CATEGORY_PROMPTS[c] for c in categories if c in CATEGORY_PROMPTS
+        )
+        if cat_instructions:
+            prompt += "\n\n## Focus areas:\n" + cat_instructions
+    if resume_text:
+        prompt += (
+            "\n\n## Candidate resume:\n"
+            "The candidate has provided their resume. Use it to tailor questions to "
+            "gaps between their experience and the job requirements. Here it is:\n\n"
+            + resume_text
+        )
     messages.append({"role": "system", "content": prompt})
     for item in history:
         if isinstance(item, dict):
@@ -286,8 +326,8 @@ def _build_messages(history: list[dict], difficulty: str) -> list[dict]:
     return messages
 
 
-def _call_model(messages: list[dict], client: InferenceClient) -> str:
-    """Send messages to the model, execute any tool calls, return final text."""
+def _call_model_streaming(messages: list[dict], client: InferenceClient):
+    """Send messages to the model, resolve tool calls, then stream the final response."""
     response = client.chat.completions.create(
         model=MODEL_ID,
         messages=messages,
@@ -297,7 +337,6 @@ def _call_model(messages: list[dict], client: InferenceClient) -> str:
     )
     msg = response.choices[0].message
 
-    # Resolve tool calls iteratively
     while msg.tool_calls:
         messages.append({
             "role": "assistant",
@@ -321,7 +360,33 @@ def _call_model(messages: list[dict], client: InferenceClient) -> str:
         )
         msg = response.choices[0].message
 
-    return (msg.content or "").strip()
+    # If tool resolution produced a final text answer, yield it
+    if msg.content:
+        yield msg.content.strip()
+        return
+
+    # Stream the final response (no tool calls pending)
+    stream = client.chat.completions.create(
+        model=MODEL_ID,
+        messages=messages,
+        tools=TOOLS,
+        tool_choice="auto",
+        max_tokens=MAX_NEW_TOKENS,
+        stream=True,
+    )
+    partial = ""
+    for chunk in stream:
+        if chunk.choices and chunk.choices[0].delta.content:
+            partial += chunk.choices[0].delta.content
+            yield partial
+
+
+def _call_model(messages: list[dict], client: InferenceClient) -> str:
+    """Non-streaming model call. Used for model-answer requests."""
+    result = ""
+    for partial in _call_model_streaming(messages, client):
+        result = partial
+    return result
 
 
 _client: InferenceClient | None = None
@@ -335,9 +400,15 @@ def _get_client() -> InferenceClient:
     return _client
 
 
-def _respond(message: str, history: list[dict], difficulty: str) -> str:
+def _respond(
+    message: str,
+    history: list[dict],
+    difficulty: str,
+    categories: list[str] | None = None,
+    resume_text: str = "",
+) -> str:
     """Generate the next assistant reply."""
-    messages = _build_messages(history, difficulty)
+    messages = _build_messages(history, difficulty, categories, resume_text)
     messages.append({"role": "user", "content": message})
     return _call_model(messages, _get_client())
 
@@ -350,6 +421,23 @@ def _format_duration(seconds: float) -> str:
     if m > 0:
         return f"{m}m {s}s"
     return f"{s}s"
+
+
+def _parse_score(text: str) -> tuple[str, int | None]:
+    """Extract <!--SCORE:N--> from the end of a response. Returns (clean_text, score)."""
+    match = re.search(r"<!--SCORE:(\d)-->", text)
+    if match:
+        score = int(match.group(1))
+        clean = text[:match.start()].rstrip()
+        return clean, max(1, min(5, score))
+    return text, None
+
+def _fmt_avg(scores: list) -> str:
+    """Format the average score for display."""
+    if not scores:
+        return ""
+    avg = sum(scores) / len(scores)
+    return f"{avg:.1f}/5 ({len(scores)} Qs)"
 
 # ── PDF export ──────────────────────────────────────────────────────────────
 
@@ -404,6 +492,15 @@ def main() -> None:
             "Paste a **job description**, upload a file, or provide a URL to start."
         )
 
+        # ── Session history ────────────────────────────────────────────
+
+        with gr.Row():
+            session_dropdown = gr.Dropdown(
+                choices=[], label="Load past session", scale=3, interactive=True
+            )
+            load_session_btn = gr.Button("Load", scale=1)
+            save_session_btn = gr.Button("Save session", scale=1)
+
         # ── Settings row ────────────────────────────────────────────────
 
         with gr.Row():
@@ -413,9 +510,23 @@ def main() -> None:
                 label="Difficulty",
                 scale=2,
             )
+            categories = gr.CheckboxGroup(
+                choices=list(CATEGORY_PROMPTS.keys()),
+                value=[],
+                label="Focus areas (optional)",
+                scale=3,
+            )
+
+        with gr.Row():
             timer_display = gr.Textbox(
                 value="",
                 label="Answer time",
+                interactive=False,
+                scale=1,
+            )
+            score_display = gr.Textbox(
+                value="",
+                label="Avg score",
                 interactive=False,
                 scale=1,
             )
@@ -431,19 +542,31 @@ def main() -> None:
             )
             upload_btn = gr.Button("Use this file")
 
+        with gr.Accordion("Upload your resume (optional)", open=False):
+            resume_upload = gr.File(
+                label="Upload resume (PDF, DOCX, or TXT)",
+                file_types=[".pdf", ".docx", ".doc", ".txt"],
+            )
+            resume_btn = gr.Button("Use this resume")
+
         # ── Chat area ──────────────────────────────────────────────────
 
-        chatbot = gr.Chatbot(height=450)
+        chatbot = gr.Chatbot(height=450, render_markdown=True)
         state = gr.State([])  # chat history as list[dict]
         question_ts = gr.State(0.0)  # timestamp when last bot message was shown
+        scores = gr.State([])  # list of int scores
+        resume_state = gr.State("")  # resume text
 
         with gr.Row():
             txt = gr.Textbox(
-                placeholder="Type your answer (or paste a JD / URL to begin)...",
+                placeholder="Type your answer (or paste a JD / URL to begin). Code snippets supported with markdown.",
                 show_label=False,
                 scale=4,
             )
             send_btn = gr.Button("Send", variant="primary", scale=1)
+
+        with gr.Row():
+            model_answer_btn = gr.Button("Show model answer", variant="secondary")
 
         # ── Voice input ─────────────────────────────────────────────────
 
@@ -451,74 +574,157 @@ def main() -> None:
             audio = gr.Audio(sources=["microphone"], type="numpy", label="Record your answer")
             voice_btn = gr.Button("Transcribe & Send")
 
+        # ── Resume upload handler ──────────────────────────────────────
+
+        def _on_resume_upload(file):
+            if file is None:
+                return ""
+            text = _extract_file_text(file)
+            if text.startswith("Error"):
+                return ""
+            return text
+
+        resume_btn.click(
+            _on_resume_upload,
+            [resume_upload],
+            [resume_state],
+        )
+
         # ── File upload handler ─────────────────────────────────────────
 
-        def _on_file_upload(file, history: list[dict], diff: str):
+        def _on_file_upload(file, history: list[dict], diff: str,
+                            score_list: list, cats: list[str], resume_txt: str):
             if file is None:
-                return history, history, "", 0.0
+                yield history, history, "", 0.0, score_list, _fmt_avg(score_list)
+                return
             text = _extract_file_text(file)
             if text.startswith("Error"):
                 history = history + [{"role": "assistant", "content": text}]
-                return history, history, "", 0.0
+                yield history, history, "", 0.0, score_list, _fmt_avg(score_list)
+                return
             user_msg = f"Here is the job description:\n\n{text}"
             history = history + [{"role": "user", "content": user_msg}]
-            reply = _respond(user_msg, history[:-1], diff)
-            history = history + [{"role": "assistant", "content": reply}]
-            return history, history, "", time.time()
+            messages = _build_messages(history[:-1], diff, cats, resume_txt)
+            messages.append({"role": "user", "content": user_msg})
+
+            partial_history = history + [{"role": "assistant", "content": ""}]
+            for partial_text in _call_model_streaming(messages, _get_client()):
+                partial_history[-1]["content"] = partial_text
+                yield (partial_history, partial_history, "", time.time(),
+                       score_list, _fmt_avg(score_list))
+
+            final_text = partial_history[-1]["content"]
+            clean_text, score = _parse_score(final_text)
+            partial_history[-1]["content"] = clean_text
+            if score is not None:
+                score_list = score_list + [score]
+            yield (partial_history, partial_history, "", time.time(),
+                   score_list, _fmt_avg(score_list))
 
         upload_btn.click(
             _on_file_upload,
-            [file_upload, state, difficulty],
-            [chatbot, state, timer_display, question_ts],
+            [file_upload, state, difficulty, scores, categories, resume_state],
+            [chatbot, state, timer_display, question_ts, scores, score_display],
         )
 
         # ── Text submit ─────────────────────────────────────────────────
 
-        def _on_text_submit(message: str, history: list[dict], diff: str, ts: float):
+        def _on_text_submit(message: str, history: list[dict], diff: str, ts: float,
+                            score_list: list, cats: list[str], resume_txt: str):
             if not message.strip():
-                return history, history, "", "", ts
-            # Calculate answer time if there's a previous bot question
+                yield history, history, "", "", ts, score_list, _fmt_avg(score_list)
+                return
             duration_str = ""
             if ts > 0 and history and history[-1].get("role") == "assistant":
                 elapsed = time.time() - ts
                 duration_str = _format_duration(elapsed)
 
             history = history + [{"role": "user", "content": message}]
-            reply = _respond(message, history[:-1], diff)
-            history = history + [{"role": "assistant", "content": reply}]
-            return history, history, "", duration_str, time.time()
+            messages = _build_messages(history[:-1], diff, cats, resume_txt)
+            messages.append({"role": "user", "content": message})
+
+            partial_history = history + [{"role": "assistant", "content": ""}]
+            for partial_text in _call_model_streaming(messages, _get_client()):
+                partial_history[-1]["content"] = partial_text
+                yield (partial_history, partial_history, "", duration_str, time.time(),
+                       score_list, _fmt_avg(score_list))
+
+            final_text = partial_history[-1]["content"]
+            clean_text, score = _parse_score(final_text)
+            partial_history[-1]["content"] = clean_text
+            if score is not None:
+                score_list = score_list + [score]
+            yield (partial_history, partial_history, "", duration_str, time.time(),
+                   score_list, _fmt_avg(score_list))
 
         txt.submit(
             _on_text_submit,
-            [txt, state, difficulty, question_ts],
-            [chatbot, state, txt, timer_display, question_ts],
+            [txt, state, difficulty, question_ts, scores, categories, resume_state],
+            [chatbot, state, txt, timer_display, question_ts, scores, score_display],
         )
         send_btn.click(
             _on_text_submit,
-            [txt, state, difficulty, question_ts],
-            [chatbot, state, txt, timer_display, question_ts],
+            [txt, state, difficulty, question_ts, scores, categories, resume_state],
+            [chatbot, state, txt, timer_display, question_ts, scores, score_display],
         )
 
         # ── Voice submit ────────────────────────────────────────────────
 
-        def _on_voice_submit(audio_data, history: list[dict], diff: str, ts: float):
+        def _on_voice_submit(audio_data, history: list[dict], diff: str, ts: float,
+                             score_list: list, cats: list[str], resume_txt: str):
             text = _transcribe_audio(audio_data)
             if not text:
-                return history, history, None, "", ts
+                yield history, history, None, "", ts, score_list, _fmt_avg(score_list)
+                return
             duration_str = ""
             if ts > 0 and history and history[-1].get("role") == "assistant":
                 elapsed = time.time() - ts
                 duration_str = _format_duration(elapsed)
 
             history = history + [{"role": "user", "content": f"[voice] {text}"}]
-            reply = _respond(text, history[:-1], diff)
-            history = history + [{"role": "assistant", "content": reply}]
-            return history, history, None, duration_str, time.time()
+            messages = _build_messages(history[:-1], diff, cats, resume_txt)
+            messages.append({"role": "user", "content": text})
+
+            partial_history = history + [{"role": "assistant", "content": ""}]
+            for partial_text in _call_model_streaming(messages, _get_client()):
+                partial_history[-1]["content"] = partial_text
+                yield (partial_history, partial_history, None, duration_str, time.time(),
+                       score_list, _fmt_avg(score_list))
+
+            final_text = partial_history[-1]["content"]
+            clean_text, score = _parse_score(final_text)
+            partial_history[-1]["content"] = clean_text
+            if score is not None:
+                score_list = score_list + [score]
+            yield (partial_history, partial_history, None, duration_str, time.time(),
+                   score_list, _fmt_avg(score_list))
 
         voice_btn.click(
             _on_voice_submit,
-            [audio, state, difficulty, question_ts],
-            [chatbot, state, audio, timer_display, question_ts],
+            [audio, state, difficulty, question_ts, scores, categories, resume_state],
+            [chatbot, state, audio, timer_display, question_ts, scores, score_display],
+        )
+
+        # ── Model answer ───────────────────────────────────────────────
+
+        def _on_model_answer(history: list[dict], diff: str, cats: list[str], resume_txt: str):
+            if not history:
+                return history, history
+            messages = _build_messages(history, diff, cats, resume_txt)
+            messages.append({
+                "role": "user",
+                "content": "Give a strong, detailed model answer for the last technical question you asked. "
+                           "Format it as if you were the ideal candidate responding. Use code blocks if relevant.",
+            })
+            reply = _call_model(messages, _get_client())
+            reply = f"**Model Answer:**\n\n{reply}"
+            history = history + [{"role": "assistant", "content": reply}]
+            return history, history
+
+        model_answer_btn.click(
+            _on_model_answer,
+            [state, difficulty, categories, resume_state],
+            [chatbot, state],
         )
 
         # ── PDF export ──────────────────────────────────────────────────
@@ -530,6 +736,57 @@ def main() -> None:
             return gr.update(value=path, visible=True)
 
         export_btn.click(_on_export, [state], [export_file])
+
+        # ── Session history (browser localStorage) ─────────────────────
+
+        save_session_js = """
+async function(history) {
+    if (!history || history.length === 0) return {choices: []};
+    const key = 'interview_session_' + Date.now();
+    const label = new Date().toLocaleString() + ' (' + history.length + ' msgs)';
+    const data = JSON.stringify({label: label, history: history});
+    localStorage.setItem(key, data);
+    const keys = Object.keys(localStorage).filter(k => k.startsWith('interview_session_'));
+    const choices = keys.map(k => {
+        try { return JSON.parse(localStorage.getItem(k)).label; } catch(e) { return k; }
+    });
+    return {choices: choices};
+}
+"""
+
+        save_session_btn.click(
+            None, [state], [session_dropdown], js=save_session_js
+        )
+
+        load_session_js = """
+async function(selected) {
+    if (!selected) return [[], []];
+    const keys = Object.keys(localStorage).filter(k => k.startsWith('interview_session_'));
+    for (const k of keys) {
+        try {
+            const data = JSON.parse(localStorage.getItem(k));
+            if (data.label === selected) return [data.history, data.history];
+        } catch(e) {}
+    }
+    return [[], []];
+}
+"""
+
+        load_session_btn.click(
+            None, [session_dropdown], [chatbot, state], js=load_session_js
+        )
+
+        populate_sessions_js = """
+async function() {
+    const keys = Object.keys(localStorage).filter(k => k.startsWith('interview_session_'));
+    const choices = keys.map(k => {
+        try { return JSON.parse(localStorage.getItem(k)).label; } catch(e) { return k; }
+    });
+    return {choices: choices.length > 0 ? choices : []};
+}
+"""
+
+        demo.load(None, [], [session_dropdown], js=populate_sessions_js)
 
     demo.launch(
         server_name="0.0.0.0",
