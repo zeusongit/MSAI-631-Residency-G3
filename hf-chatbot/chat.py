@@ -51,6 +51,8 @@ def build_messages(
 
 def call_model_streaming(messages: list[dict], client: InferenceClient):
     """Send messages to the model, resolve tool calls, then stream the final response."""
+    # First, do a non-streaming call to check if the model wants to use tools.
+    # We need the full response to see tool_calls.
     response = client.chat.completions.create(
         model=MODEL_ID,
         messages=messages,
@@ -60,6 +62,22 @@ def call_model_streaming(messages: list[dict], client: InferenceClient):
     )
     msg = response.choices[0].message
 
+    # If no tool calls, re-request as streaming for real-time token output
+    if not msg.tool_calls:
+        stream = client.chat.completions.create(
+            model=MODEL_ID,
+            messages=messages,
+            max_tokens=MAX_NEW_TOKENS,
+            stream=True,
+        )
+        partial = ""
+        for chunk in stream:
+            if chunk.choices and chunk.choices[0].delta.content:
+                partial += chunk.choices[0].delta.content
+                yield partial
+        return
+
+    # Resolve tool calls (non-streaming since we need complete tool results)
     while msg.tool_calls:
         messages.append({
             "role": "assistant",
@@ -83,17 +101,10 @@ def call_model_streaming(messages: list[dict], client: InferenceClient):
         )
         msg = response.choices[0].message
 
-    # If tool resolution produced a final text answer, yield it
-    if msg.content:
-        yield msg.content.strip()
-        return
-
-    # Stream the final response (no tool calls pending)
+    # After tool resolution, stream the final response
     stream = client.chat.completions.create(
         model=MODEL_ID,
         messages=messages,
-        tools=TOOLS,
-        tool_choice="auto",
         max_tokens=MAX_NEW_TOKENS,
         stream=True,
     )

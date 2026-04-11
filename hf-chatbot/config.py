@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 
-DEFAULT_MODEL_ID = "Qwen/Qwen2.5-Coder-32B-Instruct"
+DEFAULT_MODEL_ID = "Qwen/Qwen2.5-72B-Instruct"
 
 MODEL_ID = os.environ.get("HF_MODEL_ID", DEFAULT_MODEL_ID)
 MAX_NEW_TOKENS = int(os.environ.get("HF_MAX_NEW_TOKENS", "1024"))
