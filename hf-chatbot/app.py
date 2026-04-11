@@ -190,6 +190,28 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_resume",
+            "description": (
+                "Search the candidate's uploaded resume for relevant experience, skills, or projects. "
+                "Call this before asking about any specific skill or domain to see what the candidate "
+                "has listed. Examples: search_resume('Python projects'), "
+                "search_resume('system design experience'), search_resume('leadership roles')."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Skill, technology, or experience area to look up in the resume",
+                    }
+                },
+                "required": ["query"],
+            },
+        },
+    },
 ]
 
 # ── Tool implementations ────────────────────────────────────────────────────
@@ -307,6 +329,85 @@ def _transcribe_audio(audio_tuple) -> str:
     finally:
         os.unlink(tmp_path)
 
+# ── RAG (Resume vector store) ────────────────────────────────────────────────
+
+_rag_embedder = None
+_rag_chroma_client = None
+_rag_collection = None
+
+
+def _get_rag_embedder():
+    global _rag_embedder
+    if _rag_embedder is None:
+        from sentence_transformers import SentenceTransformer
+        _rag_embedder = SentenceTransformer("BAAI/bge-small-en-v1.5")
+    return _rag_embedder
+
+
+def _chunk_text(text: str, size: int = 400, overlap: int = 80) -> list[str]:
+    """Split text into overlapping fixed-size chunks for embedding."""
+    chunks, start = [], 0
+    while start < len(text):
+        chunks.append(text[start : start + size].strip())
+        start += size - overlap
+    return [c for c in chunks if c]
+
+
+def build_resume_index(resume_text: str) -> str:
+    """Chunk the resume, embed it, and store in an in-memory ChromaDB collection."""
+    global _rag_chroma_client, _rag_collection
+    try:
+        import chromadb
+        if _rag_chroma_client is None:
+            _rag_chroma_client = chromadb.Client()
+        try:
+            _rag_chroma_client.delete_collection("resume")
+        except Exception:
+            pass
+        _rag_collection = _rag_chroma_client.create_collection("resume")
+        chunks = _chunk_text(resume_text)
+        if not chunks:
+            return "Resume appears to be empty."
+        embeddings = _get_rag_embedder().encode(chunks).tolist()
+        _rag_collection.add(
+            documents=chunks,
+            embeddings=embeddings,
+            ids=[str(i) for i in range(len(chunks))],
+        )
+        return (
+            f"Resume indexed ({len(chunks)} chunks). "
+            "The coach will call search_resume before asking about specific skills."
+        )
+    except ImportError:
+        return (
+            "RAG dependencies not installed (sentence-transformers, chromadb). "
+            "Resume will be passed as plain text instead."
+        )
+    except Exception as e:
+        return f"Error indexing resume: {e}"
+
+
+def _search_resume(query: str) -> str:
+    """Retrieve the most relevant resume chunks for a given query."""
+    if _rag_collection is None:
+        return "No resume has been uploaded and indexed yet."
+    try:
+        n = min(3, _rag_collection.count())
+        if n == 0:
+            return "Resume index is empty."
+        q_emb = _get_rag_embedder().encode([query]).tolist()
+        results = _rag_collection.query(query_embeddings=q_emb, n_results=n)
+        docs = results.get("documents", [[]])[0]
+        if not docs:
+            return "No matching resume content found."
+        return "\n---\n".join(docs)
+    except Exception as e:
+        return f"Resume search error: {e}"
+
+
+# Register after definition to avoid forward-reference error
+_TOOL_FUNCTIONS["search_resume"] = _search_resume
+
 # ── Response tag parsing ─────────────────────────────────────────────────────
 
 _UI_HINT_RE = re.compile(r"<ui_hint>(.*?)</ui_hint>", re.DOTALL)
@@ -405,11 +506,15 @@ def _build_messages(
         if cat_instructions:
             prompt += "\n\n## Focus areas:\n" + cat_instructions
     if resume_text:
+        # Resume is RAG-indexed; instruct the model to retrieve rather than read full text.
         prompt += (
-            "\n\n## Candidate resume:\n"
-            "The candidate has provided their resume. Use it to tailor questions to "
-            "gaps between their experience and the job requirements. Here it is:\n\n"
-            + resume_text
+            "\n\n## Candidate Resume (RAG-indexed):\n"
+            "The candidate's resume is indexed for semantic search. "
+            "Before asking about any skill, technology, or experience area, "
+            "call `search_resume` with a relevant query. "
+            "Examples: search_resume('Python'), search_resume('system design'), "
+            "search_resume('leadership'). "
+            "Use results to probe gaps between their background and the job requirements."
         )
     messages.append({"role": "system", "content": prompt})
     for item in history:
@@ -492,24 +597,6 @@ def _get_client() -> InferenceClient:
         _client = InferenceClient(token=HF_TOKEN)
     return _client
 
-# ── Answer timer / score helpers ─────────────────────────────────────────────
-
-
-def _format_duration(seconds: float) -> str:
-    """Format seconds into a readable string like '1m 23s'."""
-    m, s = divmod(int(seconds), 60)
-    if m > 0:
-        return f"{m}m {s}s"
-    return f"{s}s"
-
-
-def _fmt_avg(scores: list) -> str:
-    """Format the average score for display."""
-    if not scores:
-        return ""
-    avg = sum(scores) / len(scores)
-    return f"{avg:.1f}/5 ({len(scores)} Qs)"
-
 # ── PDF export ──────────────────────────────────────────────────────────────
 
 
@@ -555,187 +642,154 @@ def _export_chat_pdf(history: list[dict]) -> str | None:
 
 def main() -> None:
     with gr.Blocks(title="Interview Prep Bot") as demo:
+
+        # ── Header ──────────────────────────────────────────────────────
         gr.Markdown(
-            "# Interview Prep Bot\n"
-            f"Model: `{MODEL_ID}` via Inference API &nbsp;|&nbsp; "
-            "Voice input powered by Whisper\n\n"
-            "Paste a **job description**, upload a file, or provide a URL to start."
+            f"## Interview Prep Bot &nbsp;·&nbsp; `{MODEL_ID}`\n"
+            "Paste a **job description** or URL below to start."
         )
 
-        # ── Session history ────────────────────────────────────────────
-
-        with gr.Row():
-            session_dropdown = gr.Dropdown(
-                choices=[], label="Load past session", scale=3, interactive=True
-            )
-            load_session_btn = gr.Button("Load", scale=1)
-            save_session_btn = gr.Button("Save session", scale=1)
-
-        # ── Settings row ────────────────────────────────────────────────
-
+        # ── Settings ────────────────────────────────────────────────────
         with gr.Row():
             difficulty = gr.Radio(
                 choices=["Easy", "Medium", "Hard"],
                 value="Medium",
                 label="Difficulty",
-                scale=2,
+                scale=1,
             )
             categories = gr.CheckboxGroup(
                 choices=list(CATEGORY_PROMPTS.keys()),
                 value=[],
-                label="Focus areas (optional)",
-                scale=3,
-            )
-
-        with gr.Row():
-            timer_display = gr.Textbox(
-                value="",
-                label="Answer time",
-                interactive=False,
-                scale=1,
-            )
-            score_display = gr.Textbox(
-                value="",
-                label="Avg score",
-                interactive=False,
-                scale=1,
-            )
-            export_btn = gr.Button("Export as PDF", scale=1)
-            export_file = gr.File(label="Download", visible=False)
-
-        # ── File upload ─────────────────────────────────────────────────
-
-        with gr.Accordion("Upload a job description file", open=False):
-            file_upload = gr.File(
-                label="Upload JD (PDF, DOCX, or TXT)",
-                file_types=[".pdf", ".docx", ".doc", ".txt"],
-            )
-            upload_btn = gr.Button("Use this file")
-
-        with gr.Accordion("Upload your resume (optional)", open=False):
-            resume_upload = gr.File(
-                label="Upload resume (PDF, DOCX, or TXT)",
-                file_types=[".pdf", ".docx", ".doc", ".txt"],
-            )
-            resume_btn = gr.Button("Use this resume")
-
-        # ── Chat area ──────────────────────────────────────────────────
-
-        chatbot = gr.Chatbot(height=450, render_markdown=True)
-        state = gr.State([])        # chat history as list[dict]
-        question_ts = gr.State(0.0) # timestamp when last bot message was shown
-        scores = gr.State([])       # list of int scores
-        resume_state = gr.State("") # resume text
-
-        # ── Dynamic answer inputs ───────────────────────────────────────
-        # Text input is ALWAYS visible. MCQ and rating rows appear above
-        # it as additional options when the model requests them.
-
-        with gr.Row(visible=False) as mcq_input_row:
-            mcq_radio = gr.Radio(
-                choices=[],
-                label="Choose the best answer",
-                interactive=True,
+                label="Focus areas",
                 scale=4,
             )
-            mcq_btn = gr.Button("Submit Answer", variant="primary", scale=1)
+            export_btn = gr.Button("📄 PDF", size="sm", scale=0, min_width=80)
+
+        export_file = gr.File(label="Download transcript", visible=False)
+
+        # ── Documents ───────────────────────────────────────────────────
+        with gr.Accordion("📁 Documents", open=False):
+            with gr.Row():
+                with gr.Column():
+                    gr.Markdown("**Job Description**")
+                    file_upload = gr.File(
+                        label="Upload (PDF, DOCX, or TXT)",
+                        file_types=[".pdf", ".docx", ".doc", ".txt"],
+                    )
+                    upload_btn = gr.Button("Use this file", size="sm")
+                with gr.Column():
+                    gr.Markdown("**Resume** — enables RAG retrieval")
+                    resume_upload = gr.File(
+                        label="Upload (PDF, DOCX, or TXT)",
+                        file_types=[".pdf", ".docx", ".doc", ".txt"],
+                    )
+                    resume_btn = gr.Button("Index resume", size="sm")
+                    resume_status = gr.Textbox(
+                        value="",
+                        label="Index status",
+                        interactive=False,
+                        placeholder="Upload a resume and click 'Index resume'.",
+                    )
+
+        # ── Chat ────────────────────────────────────────────────────────
+        chatbot = gr.Chatbot(height=540, render_markdown=True)
+
+        # ── Hidden state ────────────────────────────────────────────────
+        state = gr.State([])
+        question_ts = gr.State(0.0)
+        scores = gr.State([])
+        resume_state = gr.State("")
+
+        # ── Dynamic input rows (MCQ / rating appear above text input) ───
+        with gr.Row(visible=False) as mcq_input_row:
+            mcq_radio = gr.Radio(
+                choices=[], label="Choose the best answer",
+                interactive=True, scale=4,
+            )
+            mcq_btn = gr.Button("Submit", variant="primary", scale=1)
 
         with gr.Row(visible=False) as rating_input_row:
             rating_slider = gr.Slider(
-                minimum=1,
-                maximum=5,
-                value=3,
-                step=1,
-                label="Your rating",
-                interactive=True,
-                scale=4,
+                minimum=1, maximum=5, value=3, step=1,
+                label="Your rating", interactive=True, scale=4,
             )
-            rating_btn = gr.Button("Submit Rating", variant="primary", scale=1)
+            rating_btn = gr.Button("Submit", variant="primary", scale=1)
 
         with gr.Row(visible=True) as text_input_row:
             txt = gr.Textbox(
-                placeholder="Type your answer (or paste a JD / URL to begin). Code snippets supported with markdown.",
-                show_label=False,
-                scale=4,
+                placeholder="Type your answer, paste a JD, or enter a URL…",
+                show_label=False, scale=4,
             )
             send_btn = gr.Button("Send", variant="primary", scale=1)
 
+        # ── Action bar ──────────────────────────────────────────────────
         with gr.Row():
-            model_answer_btn = gr.Button("Show model answer", variant="secondary")
+            model_answer_btn = gr.Button("💡 Model Answer", variant="secondary", scale=1)
 
         # ── Voice input ─────────────────────────────────────────────────
-
-        with gr.Accordion("Voice input", open=False):
+        with gr.Accordion("🎤 Voice Input", open=False):
             audio = gr.Audio(sources=["microphone"], type="numpy", label="Record your answer")
-            voice_btn = gr.Button("Transcribe & Send")
+            voice_btn = gr.Button("Transcribe & Send", size="sm")
 
-        # ── Shared output list ───────────────────────────────────────────
-        # (chatbot, state, txt, timer_display, question_ts, scores,
-        #  score_display, text_input_row, mcq_input_row, mcq_radio,
-        #  rating_input_row, rating_slider)
+        # ── Sessions ────────────────────────────────────────────────────
+        with gr.Accordion("💾 Sessions", open=False):
+            with gr.Row():
+                session_dropdown = gr.Dropdown(
+                    choices=[], label="Load past session", scale=3, interactive=True
+                )
+                load_session_btn = gr.Button("Load", scale=1)
+                save_session_btn = gr.Button("Save", scale=1)
 
+        # ── Shared output tuple (must match yield order in handlers) ────
         _outputs = [
-            chatbot, state, txt, timer_display, question_ts, scores, score_display,
+            chatbot, state, txt, question_ts, scores,
             text_input_row, mcq_input_row, mcq_radio, rating_input_row, rating_slider,
         ]
 
-        # ── Resume upload handler ────────────────────────────────────────
-
+        # ── Resume handler ───────────────────────────────────────────────
         def _on_resume_upload(file):
             if file is None:
-                return ""
+                return "", ""
             text = _extract_file_text(file)
-            return "" if text.startswith("Error") else text
+            if text.startswith("Error"):
+                return "", text
+            return text, build_resume_index(text)
 
-        resume_btn.click(_on_resume_upload, [resume_upload], [resume_state])
+        resume_btn.click(_on_resume_upload, [resume_upload], [resume_state, resume_status])
 
         # ── Streaming helper ─────────────────────────────────────────────
-
-        def _stream_reply(user_msg, history, diff, ts, score_list, cats, resume_txt,
-                          clear_audio=False):
-            """
-            Shared generator for text/voice/MCQ/rating/file submit handlers.
-            Yields tuples matching _outputs on each streaming chunk, then a
-            final tuple with tags stripped and input visibility updated.
-            """
-            duration_str = ""
-            if ts > 0 and history and history[-1].get("role") == "assistant":
-                duration_str = _format_duration(time.time() - ts)
-
+        def _stream_reply(user_msg, history, diff, ts, score_list, cats, resume_txt):
             messages = _build_messages(history[:-1], diff, cats, resume_txt)
             messages.append({"role": "user", "content": user_msg})
-
             partial_history = history + [{"role": "assistant", "content": ""}]
 
             for partial_text in _call_model_streaming(messages, _get_client()):
                 partial_history[-1]["content"] = partial_text
                 yield (
-                    partial_history, partial_history, "", duration_str, time.time(),
-                    score_list, _fmt_avg(score_list),
+                    partial_history, partial_history, "", time.time(), score_list,
                 ) + _no_change_visibility()
 
-            # Final chunk: strip tags and update input UI
             final_text = partial_history[-1]["content"]
             clean_text, hint, score = _parse_tags(final_text)
             partial_history[-1]["content"] = clean_text
             if score is not None:
                 score_list = score_list + [score]
-
             yield (
-                partial_history, partial_history, "", duration_str, time.time(),
-                score_list, _fmt_avg(score_list),
+                partial_history, partial_history, "", time.time(), score_list,
             ) + _input_visibility(hint)
 
-        # ── File upload handler ─────────────────────────────────────────
-
+        # ── File upload handler ──────────────────────────────────────────
         def _on_file_upload(file, history, diff, ts, score_list, cats, resume_txt):
             if file is None:
-                yield (history, history, "", "", ts, score_list, _fmt_avg(score_list)) + _no_change_visibility()
+                yield (history, history, "", ts, score_list) + _no_change_visibility()
                 return
             text = _extract_file_text(file)
             if text.startswith("Error"):
-                err_history = history + [{"role": "assistant", "content": text}]
-                yield (err_history, err_history, "", "", ts, score_list, _fmt_avg(score_list)) + _no_change_visibility()
+                yield (
+                    history + [{"role": "assistant", "content": text}],
+                    history + [{"role": "assistant", "content": text}],
+                    "", ts, score_list,
+                ) + _no_change_visibility()
                 return
             user_msg = f"Here is the job description:\n\n{text}"
             history = history + [{"role": "user", "content": user_msg}]
@@ -747,11 +801,10 @@ def main() -> None:
             _outputs,
         )
 
-        # ── Text submit ─────────────────────────────────────────────────
-
+        # ── Text submit ──────────────────────────────────────────────────
         def _on_text_submit(message, history, diff, ts, score_list, cats, resume_txt):
             if not message.strip():
-                yield (history, history, "", "", ts, score_list, _fmt_avg(score_list)) + _no_change_visibility()
+                yield (history, history, "", ts, score_list) + _no_change_visibility()
                 return
             history = history + [{"role": "user", "content": message}]
             yield from _stream_reply(message, history, diff, ts, score_list, cats, resume_txt)
@@ -767,11 +820,10 @@ def main() -> None:
             _outputs,
         )
 
-        # ── MCQ submit ──────────────────────────────────────────────────
-
+        # ── MCQ submit ───────────────────────────────────────────────────
         def _on_mcq_submit(selection, history, diff, ts, score_list, cats, resume_txt):
             if not selection:
-                yield (history, history, "", "", ts, score_list, _fmt_avg(score_list)) + _no_change_visibility()
+                yield (history, history, "", ts, score_list) + _no_change_visibility()
                 return
             history = history + [{"role": "user", "content": selection}]
             yield from _stream_reply(selection, history, diff, ts, score_list, cats, resume_txt)
@@ -782,11 +834,10 @@ def main() -> None:
             _outputs,
         )
 
-        # ── Rating submit ───────────────────────────────────────────────
-
+        # ── Rating submit ────────────────────────────────────────────────
         def _on_rating_submit(value, history, diff, ts, score_list, cats, resume_txt):
             if value is None:
-                yield (history, history, "", "", ts, score_list, _fmt_avg(score_list)) + _no_change_visibility()
+                yield (history, history, "", ts, score_list) + _no_change_visibility()
                 return
             message = str(int(value))
             history = history + [{"role": "user", "content": message}]
@@ -798,12 +849,11 @@ def main() -> None:
             _outputs,
         )
 
-        # ── Voice submit ────────────────────────────────────────────────
-
+        # ── Voice submit ─────────────────────────────────────────────────
         def _on_voice_submit(audio_data, history, diff, ts, score_list, cats, resume_txt):
             text = _transcribe_audio(audio_data)
             if not text:
-                yield (history, history, "", "", ts, score_list, _fmt_avg(score_list)) + _no_change_visibility()
+                yield (history, history, "", ts, score_list) + _no_change_visibility()
                 return
             history = history + [{"role": "user", "content": f"[voice] {text}"}]
             yield from _stream_reply(text, history, diff, ts, score_list, cats, resume_txt)
@@ -814,8 +864,7 @@ def main() -> None:
             _outputs,
         )
 
-        # ── Model answer ───────────────────────────────────────────────
-
+        # ── Model answer ─────────────────────────────────────────────────
         def _on_model_answer(history, diff, cats, resume_txt):
             if not history:
                 return history, history
@@ -837,8 +886,7 @@ def main() -> None:
             [chatbot, state],
         )
 
-        # ── PDF export ──────────────────────────────────────────────────
-
+        # ── PDF export ───────────────────────────────────────────────────
         def _on_export(history):
             path = _export_chat_pdf(history)
             if path is None:
@@ -847,8 +895,7 @@ def main() -> None:
 
         export_btn.click(_on_export, [state], [export_file])
 
-        # ── Session history (browser localStorage) ─────────────────────
-
+        # ── Session history (browser localStorage) ───────────────────────
         save_session_js = """
 async function(history) {
     if (!history || history.length === 0) return {choices: []};
@@ -863,7 +910,6 @@ async function(history) {
     return {choices: choices};
 }
 """
-
         save_session_btn.click(None, [state], [session_dropdown], js=save_session_js)
 
         load_session_js = """
@@ -879,7 +925,6 @@ async function(selected) {
     return [[], []];
 }
 """
-
         load_session_btn.click(None, [session_dropdown], [chatbot, state], js=load_session_js)
 
         populate_sessions_js = """
@@ -891,7 +936,6 @@ async function() {
     return {choices: choices.length > 0 ? choices : []};
 }
 """
-
         demo.load(None, [], [session_dropdown], js=populate_sessions_js)
 
     demo.launch(
