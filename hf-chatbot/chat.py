@@ -50,9 +50,84 @@ def build_messages(
 
 
 def call_model_streaming(messages: list[dict], client: InferenceClient):
-    """Send messages to the model, resolve tool calls, then stream the final response."""
-    # First, do a non-streaming call to check if the model wants to use tools.
-    # We need the full response to see tool_calls.
+    """Send messages to the model, resolve tool calls, then stream the final response.
+
+    Streams directly from the first request. If the model returns tool calls
+    instead of content, resolves them and then streams the follow-up.
+    """
+    # Try streaming first — this is the common path (no tool calls)
+    stream = client.chat.completions.create(
+        model=MODEL_ID,
+        messages=messages,
+        tools=TOOLS,
+        tool_choice="auto",
+        max_tokens=MAX_NEW_TOKENS,
+        stream=True,
+    )
+
+    # Collect the stream, watching for tool calls
+    partial = ""
+    tool_calls_raw: list[dict] = {}  # index -> {id, name, arguments}
+    for chunk in stream:
+        if not chunk.choices:
+            continue
+        delta = chunk.choices[0].delta
+
+        # Accumulate streamed content
+        if delta.content:
+            partial += delta.content
+            yield partial
+
+        # Accumulate tool call fragments
+        if hasattr(delta, "tool_calls") and delta.tool_calls:
+            for tc in delta.tool_calls:
+                idx = tc.index
+                if idx not in tool_calls_raw:
+                    tool_calls_raw[idx] = {
+                        "id": tc.id or "",
+                        "name": tc.function.name if tc.function and tc.function.name else "",
+                        "arguments": "",
+                    }
+                if tc.id:
+                    tool_calls_raw[idx]["id"] = tc.id
+                if tc.function:
+                    if tc.function.name:
+                        tool_calls_raw[idx]["name"] = tc.function.name
+                    if tc.function.arguments:
+                        tool_calls_raw[idx]["arguments"] += tc.function.arguments
+
+    # If we got content and no tool calls, we're done
+    if partial and not tool_calls_raw:
+        return
+
+    # If no tool calls were found at all, return whatever we have
+    if not tool_calls_raw:
+        return
+
+    # Resolve tool calls
+    assembled_tool_calls = []
+    for idx in sorted(tool_calls_raw.keys()):
+        tc_data = tool_calls_raw[idx]
+        assembled_tool_calls.append({
+            "id": tc_data["id"],
+            "type": "function",
+            "function": {"name": tc_data["name"], "arguments": tc_data["arguments"]},
+        })
+
+    messages.append({"role": "assistant", "tool_calls": assembled_tool_calls})
+
+    for tc_dict in assembled_tool_calls:
+        # Create a simple object to pass to execute_tool
+        class _ToolCall:
+            def __init__(self, d):
+                self.id = d["id"]
+                self.function = type("F", (), {
+                    "name": d["function"]["name"],
+                    "arguments": d["function"]["arguments"],
+                })()
+        messages.append(execute_tool(_ToolCall(tc_dict)))
+
+    # After tool resolution, check if model wants more tools or is ready to respond
     response = client.chat.completions.create(
         model=MODEL_ID,
         messages=messages,
@@ -62,22 +137,7 @@ def call_model_streaming(messages: list[dict], client: InferenceClient):
     )
     msg = response.choices[0].message
 
-    # If no tool calls, re-request as streaming for real-time token output
-    if not msg.tool_calls:
-        stream = client.chat.completions.create(
-            model=MODEL_ID,
-            messages=messages,
-            max_tokens=MAX_NEW_TOKENS,
-            stream=True,
-        )
-        partial = ""
-        for chunk in stream:
-            if chunk.choices and chunk.choices[0].delta.content:
-                partial += chunk.choices[0].delta.content
-                yield partial
-        return
-
-    # Resolve tool calls (non-streaming since we need complete tool results)
+    # If more tool calls, resolve them iteratively
     while msg.tool_calls:
         messages.append({
             "role": "assistant",
@@ -101,7 +161,7 @@ def call_model_streaming(messages: list[dict], client: InferenceClient):
         )
         msg = response.choices[0].message
 
-    # After tool resolution, stream the final response
+    # Stream the final response after all tools are resolved
     stream = client.chat.completions.create(
         model=MODEL_ID,
         messages=messages,
